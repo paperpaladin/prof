@@ -1,0 +1,7 @@
+prof
+t/workload
+*.o
+*.folded
+*.out
+*.svg
+perf.data*
