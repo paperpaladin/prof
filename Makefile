@@ -14,7 +14,10 @@ prof: prof.c
 t/workload: t/workload.c
 	$(CC) $(TCFLAGS) -o $@ $<
 
+test: all
+	@sh t/run.sh
+
 clean:
 	rm -f prof t/workload t/*.out t/*.folded
 
-.PHONY: all clean
+.PHONY: all test clean
