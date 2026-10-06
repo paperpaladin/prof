@@ -72,5 +72,37 @@ if [ "$n" -lt 50 ]; then
 	exit 1
 fi
 
+# --- 2. the hottest symbol is NAMED correctly ---------------------------
+$PROF -o "$TMP/flat" -- $WL 1 >/dev/null 2>"$TMP/err"
+top=$(grep -v '^#' "$TMP/flat" | head -1 | awk '{print $NF}')
+if [ "$top" = hot ]; then
+	ok "symbolisation: hottest symbol is named 'hot'"
+else
+	bad "symbolisation: hottest symbol is named 'hot'" "got '$top'"
+fi
+
+# --- 3. the planted ratios -------------------------------------------- --
+hp=$(selfpct "$TMP/flat" hot)
+hc=$(selfcnt "$TMP/flat" hot)
+wc_=$(selfcnt "$TMP/flat" warm)
+cc=$(selfcnt "$TMP/flat" cold)
+: "${hp:=0}" "${hc:=0}" "${wc_:=0}" "${cc:=0}"
+
+if num "$hp > 60"; then
+	ok "oracle: hot() holds $hp% of samples (built to be ~90%, need >60%)"
+else
+	bad "oracle: hot() should hold >60% of samples" "got $hp%"
+fi
+if num "$wc_ > 0 && $hc > 3 * $wc_"; then
+	ok "oracle: hot/warm = $(awk "BEGIN{printf \"%.1f\", $hc/$wc_}")x (built as 10x, need >3x)"
+else
+	bad "oracle: hot should take >3x the samples of warm" "hot=$hc warm=$wc_"
+fi
+if [ "$wc_" -gt "$cc" ]; then
+	ok "oracle: warm($wc_) > cold($cc), as built (10:1)"
+else
+	bad "oracle: warm should outweigh cold" "warm=$wc_ cold=$cc"
+fi
+
 printf '\n%d passed, %d failed, %d skipped\n' "$P" "$F" "$S"
 [ "$F" -eq 0 ]
