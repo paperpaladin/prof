@@ -2,10 +2,10 @@
  *
  * Usage: prof [-F HZ] [-o FILE] -- ./prog args...
  *
- * What it does so far:
- *   fork/exec the target with a perf event already attached (enable_on_exec),
- *   choose a sampling event this kernel will actually give an unprivileged
- *   user, and report which one that was.
+ * What it does, end to end:
+ *   fork/exec the target with the perf events already attached (enable_on_exec),
+ *   drain the per-CPU ring buffers without blocking, and report how many
+ *   samples arrived and how many the kernel had to drop.
  *
  * No libelf, no libunwind, no libdw. C11 + Linux headers only.
  */
@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -25,8 +26,13 @@
 
 #include <linux/perf_event.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+
+/* shortcut: a fixed ring size instead of a tuning knob. It must stay under
+ * perf_event_mlock_kb per CPU. Upgrade path, if it ever bites: make it a flag. */
+#define BUF_PAGES   64       /* data pages per per-CPU ring buffer (power of 2) */
 
 static const char *prog = "prof";
 
@@ -40,12 +46,68 @@ static void die(const char *fmt, ...) {
 	exit(2);
 }
 
+static void *xmalloc(size_t n) {
+	void *p = malloc(n);
+	if (!p) die("out of memory");
+	return p;
+}
+
 /* ------------------------------------------------------------------ *
  * perf_event_open plumbing.
  * ------------------------------------------------------------------ */
 
+struct ring {
+	int fd;
+	struct perf_event_mmap_page *meta;
+	unsigned char *data;
+	size_t dsize;
+};
+
+static struct ring *rings;
+static int nrings;
+static uint64_t n_samples, n_lost;
+
 static long perf_open(struct perf_event_attr *a, pid_t pid, int cpu) {
 	return syscall(SYS_perf_event_open, a, pid, cpu, -1, 0UL);
+}
+
+/* Copy n bytes out of the ring at logical offset off, unwrapping the circular
+ * buffer. Records straddle the end of the data area, so nothing may read the
+ * mapping linearly. */
+static void ring_copy(struct ring *r, uint64_t off, void *dst, size_t n) {
+	size_t m = r->dsize - 1, o = off & m;
+	size_t first = r->dsize - o;
+	if (first > n) first = n;
+	memcpy(dst, r->data + o, first);
+	if (n > first) memcpy((char *)dst + first, r->data, n - first);
+}
+
+/* Drain one per-CPU buffer. Must never block: while we are not draining the
+ * kernel keeps writing, and once data_head laps data_tail the kernel drops
+ * samples and reports PERF_RECORD_LOST. The whole loop is therefore
+ * poll()-with-timeout plus waitpid(WNOHANG), never a blocking wait on the
+ * child. */
+static void drain(struct ring *r) {
+	uint64_t head = r->meta->data_head;
+	__atomic_thread_fence(__ATOMIC_ACQUIRE); /* pairs with the kernel's store-release of data_head */
+	uint64_t tail = r->meta->data_tail;
+
+	static unsigned char rec[1 << 16];
+	while (tail < head) {
+		struct perf_event_header h;
+		ring_copy(r, tail, &h, sizeof h);
+		/* h.size is a u16, so it always fits rec[]; a zero size would loop forever. */
+		if (h.size < sizeof h) break;
+		ring_copy(r, tail, rec, h.size);
+		tail += h.size;
+		if (h.type == PERF_RECORD_SAMPLE)
+			n_samples++; /* contents are decoded in the next commit */
+		else if (h.type == PERF_RECORD_LOST && h.size >= sizeof h + 16)
+			n_lost += *(uint64_t *)(rec + sizeof h + 8);
+	}
+
+	__atomic_thread_fence(__ATOMIC_RELEASE); /* finish reading before publishing tail */
+	r->meta->data_tail = tail;
 }
 
 /* ------------------------------------------------------------------ */
@@ -111,13 +173,13 @@ int main(int argc, char **argv) {
 
 	struct perf_event_attr a;
 	const char *evname = NULL;
-	int fd = -1;
+	int ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+	if (ncpu < 1) ncpu = 1;
+	rings = xmalloc(ncpu * sizeof *rings);
 
-	/* Mechanism ladder. The hardware cycle counter is the best signal when a PMU
-	 * is exposed; a VM or container without PMU pass-through has none, and then
-	 * the software cpu-clock hrtimer is what you get. Whichever one opens is
-	 * reported by name, so the output never claims a mechanism it did not get. */
-	for (int attempt = 0; attempt < 3 && fd < 0; attempt++) {
+	/* Prefer the hardware cycle counter; fall back to the software cpu-clock
+	 * hrtimer, which is all you get in a VM or container with no PMU pass-through. */
+	for (int attempt = 0; attempt < 3 && nrings == 0; attempt++) {
 		memset(&a, 0, sizeof a);
 		a.size = sizeof a;
 		switch (attempt) {
@@ -138,16 +200,30 @@ int main(int argc, char **argv) {
 		a.inherit = 1; /* follow threads and forked children */
 		a.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID;
 
-		/* One per-task event following the target wherever it is scheduled. */
-		fd = perf_open(&a, pid, -1);
+		/* One event per CPU rather than one per-task event: the kernel refuses
+		 * to mmap a per-task event with inherit=1 (all children would share one
+		 * ring), so following threads means binding per CPU, exactly as
+		 * perf record does. */
+		for (int c = 0; c < ncpu; c++) {
+			long fd = perf_open(&a, pid, c);
+			if (fd < 0) continue;
+			size_t len = (BUF_PAGES + 1) * (size_t)sysconf(_SC_PAGESIZE);
+			void *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+			if (m == MAP_FAILED) { close(fd); continue; }
+			rings[nrings].fd = fd;
+			rings[nrings].meta = m;
+			rings[nrings].data = (unsigned char *)m + sysconf(_SC_PAGESIZE);
+			rings[nrings].dsize = len - sysconf(_SC_PAGESIZE);
+			nrings++;
+		}
 	}
 
-	if (fd < 0) {
+	if (nrings == 0) {
 		int e = errno;
 		kill(pid, SIGKILL);
 		waitpid(pid, NULL, 0);
 		fprintf(stderr,
-		        "%s: perf_event_open failed: %s\n"
+		        "%s: perf_event_open failed on every CPU: %s\n"
 		        "%s: perf_event_paranoid=%s (sampling needs <= 2; this build only ever\n"
 		        "%s:   asks for user-space events, exclude_kernel=1)\n"
 		        "%s: perf_event_max_sample_rate=%s (-F %d must not exceed it)\n",
@@ -161,13 +237,29 @@ int main(int argc, char **argv) {
 	if (write(pfd[1], "g", 1) != 1) die("write: %s", strerror(errno));
 	close(pfd[1]);
 
-	int status = 0;
-	if (waitpid(pid, &status, 0) < 0) die("waitpid: %s", strerror(errno));
+	struct pollfd *pfds = xmalloc(nrings * sizeof *pfds);
+	for (int c = 0; c < nrings; c++) {
+		pfds[c].fd = rings[c].fd;
+		pfds[c].events = POLLIN;
+	}
+
+	int status = 0, reaped = 0;
+	while (!reaped) {
+		poll(pfds, nrings, 20);
+		for (int c = 0; c < nrings; c++) drain(&rings[c]);
+		pid_t w = waitpid(pid, &status, WNOHANG);
+		if (w == pid) reaped = 1;
+		else if (w < 0 && errno != EINTR) break;
+	}
+	/* The child is gone but its last samples are still in the rings. */
+	for (int c = 0; c < nrings; c++) drain(&rings[c]);
 
 	/* Always on stderr: never on stdout, because a profiler that pollutes the
 	 * target's stdout is not transparent and cannot be dropped into a pipeline. */
-	fprintf(stderr, "%s: armed %s @ %d Hz; no ring buffer yet, so the kernel has\n"
-	                "%s: nowhere to put the samples and drops them\n", prog, evname, hz, prog);
+	fprintf(stderr, "%s: %" PRIu64 " samples, %" PRIu64 " lost, %s @ %d Hz, %d/%d cpus\n",
+	        prog, n_samples, n_lost, evname, hz, nrings, ncpu);
+	if (n_samples == 0)
+		fprintf(stderr, "%s: no samples -- target too short-lived, or off-CPU the whole time\n", prog);
 
 	if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
 	return WEXITSTATUS(status);
