@@ -118,5 +118,39 @@ else
 	bad "unwind: folded output is well formed" "$(head -3 "$TMP/fold")"
 fi
 
+# --- 5. the maps snapshot is complete ------------------------------------
+# A target that execs a second image is the deterministic form of a bug that any
+# single snapshot of /proc/PID/maps has: the snapshot is taken when the first
+# image appears and never sees the second, so every address resolves to a bare
+# hex number. Following an exec is also worth having on its own -- a wrapper
+# script that ends in `exec ./real-binary` is the common way to launch things.
+$PROF -F 300 --folded -o "$TMP/xexec" -- /bin/sh -c "exec $WL 1" >/dev/null 2>&1
+if grep -q 'main;level1;level2;hot [0-9]' "$TMP/xexec"; then
+	ok "maps: symbols still resolve when the target execs another image"
+else
+	bad "maps: symbols must still resolve when the target execs another image" \
+	    "$(head -2 "$TMP/xexec")"
+fi
+
+# The same bug has an intermittent form on an ordinary target.
+# The walk must reach past main into the process entry frame in libc. If the
+# snapshot of /proc/PID/maps is incomplete, a return address into libc looks
+# unmapped and the walk stops at main -- intermittently rather than always,
+# which is strictly worse. Three runs, because intermittent is how it showed up.
+outer_ok=1; outer_saw=
+for r in 1 2 3; do
+	$PROF --folded -o "$TMP/f$r" -- $WL 1 >/dev/null 2>&1
+	o=$(awk -F';' '{print $1}' "$TMP/f$r" | sort -u)
+	n=$(printf '%s\n' "$o" | wc -l)
+	outer_saw="$outer_saw[$(printf '%s' "$o" | tr '\n' ',')]"
+	{ [ "$n" = 1 ] && [ "$o" != main ]; } || outer_ok=0
+done
+if [ "$outer_ok" = 1 ]; then
+	ok "maps: every stack reaches past main into the entry frame $outer_saw"
+else
+	bad "maps: every stack must reach past main into the entry frame" \
+	    "saw $outer_saw -- an incomplete /proc/PID/maps truncates the walk"
+fi
+
 printf '\n%d passed, %d failed, %d skipped\n' "$P" "$F" "$S"
 [ "$F" -eq 0 ]
