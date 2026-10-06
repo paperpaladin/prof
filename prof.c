@@ -4,8 +4,9 @@
  *
  * What it does, end to end:
  *   fork/exec the target with the perf events already attached (enable_on_exec),
- *   take periodic samples of the instruction pointer, attribute each address
- *   to the object mapped there, and aggregate into a flat profile.
+ *   take periodic samples of the instruction pointer, resolve each address
+ *   against the ELF .symtab/.dynsym of whatever file is mapped there, and
+ *   aggregate into a flat profile.
  *
  * No libelf, no libunwind, no libdw. C11 + Linux headers only.
  */
@@ -25,9 +26,11 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <elf.h>
 #include <linux/perf_event.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 
@@ -117,7 +120,7 @@ static struct ent *tab_get(struct tab *t, const char *key) {
 }
 
 /* ------------------------------------------------------------------ *
- * Address space of the target: its executable mappings.
+ * Address space of the target: executable mappings + ELF symbols.
  * ------------------------------------------------------------------ */
 
 struct map {
@@ -125,8 +128,99 @@ struct map {
 	char path[PATH_MAX];
 };
 
+struct sym {
+	uint64_t addr, size;
+	char *name;
+};
+
 static struct map maps[512];
 static int nmaps;
+static struct sym *syms;
+static size_t nsyms, csyms;
+
+static void sym_add(uint64_t addr, uint64_t size, const char *name) {
+	if (nsyms == csyms) {
+		csyms = csyms ? csyms * 2 : 4096;
+		syms = realloc(syms, csyms * sizeof *syms);
+		if (!syms) die("out of memory");
+	}
+	syms[nsyms].addr = addr;
+	syms[nsyms].size = size;
+	syms[nsyms].name = strdup(name);
+	nsyms++;
+}
+
+static int sym_cmp(const void *a, const void *b) {
+	const struct sym *x = a, *y = b;
+	if (x->addr < y->addr) return -1;
+	if (x->addr > y->addr) return 1;
+	return 0;
+}
+
+/* Load bias for a file mapped at m: the value to add to an st_value from the
+ * file to get a runtime address. For ET_EXEC this comes out 0. For ET_DYN
+ * (PIE and shared libraries) we locate the PT_LOAD segment that this mapping
+ * is a window onto and subtract its vaddr/offset skew -- doing it per segment
+ * rather than assuming p_vaddr == p_offset keeps us correct under -z
+ * separate-code, where a binary has several PT_LOADs. */
+static uint64_t load_bias(const Elf64_Ehdr *eh, const void *base, const struct map *m) {
+	if (eh->e_type == ET_EXEC) return 0;
+	const Elf64_Phdr *ph = (const Elf64_Phdr *)((const char *)base + eh->e_phoff);
+	for (int i = 0; i < eh->e_phnum; i++) {
+		if (ph[i].p_type != PT_LOAD || !(ph[i].p_flags & PF_X)) continue;
+		if (m->pgoff >= ph[i].p_offset && m->pgoff < ph[i].p_offset + ph[i].p_filesz)
+			return m->start - (ph[i].p_vaddr + (m->pgoff - ph[i].p_offset));
+	}
+	return m->start - m->pgoff; /* best effort */
+}
+
+/* Parse .symtab (preferred) and .dynsym out of one ELF file by hand. */
+static void load_elf_syms(const struct map *m) {
+	int fd = open(m->path, O_RDONLY);
+	if (fd < 0) return;
+	struct stat st;
+	if (fstat(fd, &st) < 0 || (size_t)st.st_size < sizeof(Elf64_Ehdr)) {
+		close(fd);
+		return;
+	}
+	char *b = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	close(fd);
+	if (b == MAP_FAILED) return;
+
+	const Elf64_Ehdr *eh = (const Elf64_Ehdr *)b;
+	if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 ||
+	    eh->e_ident[EI_CLASS] != ELFCLASS64 ||
+	    eh->e_shoff == 0 || eh->e_shentsize != sizeof(Elf64_Shdr) ||
+	    eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(Elf64_Shdr) > (uint64_t)st.st_size)
+		goto out; /* shortcut: 64-bit little-endian ELF only; no 32-bit, no cross-endian. */
+
+	uint64_t bias = load_bias(eh, b, m);
+	const Elf64_Shdr *sh = (const Elf64_Shdr *)(b + eh->e_shoff);
+
+	for (int i = 0; i < eh->e_shnum; i++) {
+		if (sh[i].sh_type != SHT_SYMTAB && sh[i].sh_type != SHT_DYNSYM) continue;
+		if (sh[i].sh_entsize != sizeof(Elf64_Sym) || sh[i].sh_link >= eh->e_shnum) continue;
+		const Elf64_Shdr *strs = &sh[sh[i].sh_link];
+		if (sh[i].sh_offset + sh[i].sh_size > (uint64_t)st.st_size) continue;
+		if (strs->sh_offset + strs->sh_size > (uint64_t)st.st_size) continue;
+
+		const Elf64_Sym *sy = (const Elf64_Sym *)(b + sh[i].sh_offset);
+		size_t n = sh[i].sh_size / sizeof(Elf64_Sym);
+		const char *sp = b + strs->sh_offset;
+		for (size_t k = 0; k < n; k++) {
+			if (ELF64_ST_TYPE(sy[k].st_info) != STT_FUNC) continue;
+			if (sy[k].st_shndx == SHN_UNDEF || sy[k].st_value == 0) continue;
+			if (sy[k].st_name >= strs->sh_size) continue;
+			const char *nm = sp + sy[k].st_name;
+			if (!*nm) continue;
+			sym_add(bias + sy[k].st_value, sy[k].st_size, nm);
+		}
+		/* .symtab is a superset of .dynsym, so stop once we've found it. */
+		if (sh[i].sh_type == SHT_SYMTAB) break;
+	}
+out:
+	munmap(b, st.st_size);
+}
 
 static const char *base_name(const char *p) {
 	const char *s = strrchr(p, '/');
@@ -175,12 +269,43 @@ static int snapshot_maps(pid_t pid, const char *want) {
 		usleep(500);
 	}
 
+	/* Parse each (path, bias) pair once. */
+	for (int i = 0; i < nmaps; i++) {
+		int dup = 0;
+		for (int j = 0; j < i; j++)
+			if (strcmp(maps[i].path, maps[j].path) == 0 &&
+			    maps[i].pgoff - maps[i].start == maps[j].pgoff - maps[j].start)
+				dup = 1;
+		if (!dup) load_elf_syms(&maps[i]);
+	}
+	qsort(syms, nsyms, sizeof *syms, sym_cmp);
+
 	return nmaps;
 }
 
-/* Attribute an address to the file mapped there, as module+offset. Real symbol
- * names come next; this already tells you which object the time is in. */
+/* Greatest symbol whose address is <= a. Falls back to the module basename so
+ * that an unresolved frame in a stripped library is still attributable. */
 static const char *resolve(uint64_t a, char *buf, size_t bufsz) {
+	size_t lo = 0, hi = nsyms, best = (size_t)-1;
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (syms[mid].addr <= a) {
+			best = mid;
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	/* shortcut: symbols only, no JIT support. A JVM/V8/LuaJIT frame has no ELF
+	 * symbol and falls through to module+offset below; reading
+	 * /tmp/perf-PID.map is the established fix. */
+	if (best != (size_t)-1) {
+		/* st_size == 0 happens for hand-written asm; accept it rather than
+		 * dropping the symbol, and let the next symbol bound it. */
+		uint64_t end = syms[best].size ? syms[best].addr + syms[best].size
+		                               : (best + 1 < nsyms ? syms[best + 1].addr : a + 1);
+		if (a < end) return syms[best].name;
+	}
 	for (int i = 0; i < nmaps; i++)
 		if (a >= maps[i].start && a < maps[i].end) {
 			snprintf(buf, bufsz, "%s+0x%" PRIx64, base_name(maps[i].path), a - maps[i].start);
