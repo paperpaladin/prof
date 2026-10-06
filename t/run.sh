@@ -104,5 +104,19 @@ else
 	bad "oracle: warm should outweigh cold" "warm=$wc_ cold=$cc"
 fi
 
+# --- 4. the call chain ---------------------------------------------------
+$PROF --folded -o "$TMP/fold" -- $WL 1 >/dev/null 2>&1
+if grep -q 'main;level1;level2;hot ' "$TMP/fold"; then
+	ok "unwind: folded output contains main;level1;level2;hot"
+else
+	bad "unwind: folded output contains main;level1;level2;hot" "$(head -3 "$TMP/fold")"
+fi
+# A folded line is "stack count" and nothing else, or flamegraph tools choke.
+if awk '{ if (NF != 2 || $2 !~ /^[0-9]+$/) exit 1 }' "$TMP/fold"; then
+	ok "unwind: folded output is well formed ('stack count' per line)"
+else
+	bad "unwind: folded output is well formed" "$(head -3 "$TMP/fold")"
+fi
+
 printf '\n%d passed, %d failed, %d skipped\n' "$P" "$F" "$S"
 [ "$F" -eq 0 ]
