@@ -4,8 +4,8 @@
  *
  * What it does, end to end:
  *   fork/exec the target with the perf events already attached (enable_on_exec),
- *   drain the per-CPU ring buffers without blocking, and report how many
- *   samples arrived and how many the kernel had to drop.
+ *   take periodic samples of the instruction pointer, and aggregate them into
+ *   a flat profile of addresses.
  *
  * No libelf, no libunwind, no libdw. C11 + Linux headers only.
  */
@@ -53,6 +53,69 @@ static void *xmalloc(size_t n) {
 }
 
 /* ------------------------------------------------------------------ *
+ * String-keyed counter table.
+ *
+ * Used for exactly two things: folded stacks -> count, and symbol name ->
+ * {self, total}. Two use cases, so one shared open-addressed table and no
+ * further abstraction.
+ * ------------------------------------------------------------------ */
+
+struct ent {
+	char *key;
+	uint64_t self;  /* samples whose innermost frame is this symbol */
+};
+
+struct tab {
+	struct ent *e;
+	size_t cap; /* power of two */
+	size_t n;
+};
+
+static uint64_t fnv1a(const char *s) {
+	uint64_t h = 0xcbf29ce484222325ULL;
+	for (; *s; s++) {
+		h ^= (unsigned char)*s;
+		h *= 0x100000001b3ULL;
+	}
+	return h;
+}
+
+static void tab_init(struct tab *t, size_t cap) {
+	t->cap = cap;
+	t->n = 0;
+	t->e = calloc(cap, sizeof *t->e);
+	if (!t->e) die("out of memory");
+}
+
+static void tab_grow(struct tab *t) {
+	struct tab nt;
+	tab_init(&nt, t->cap * 2);
+	for (size_t i = 0; i < t->cap; i++) {
+		if (!t->e[i].key) continue;
+		size_t m = nt.cap - 1, j = fnv1a(t->e[i].key) & m;
+		while (nt.e[j].key) j = (j + 1) & m;
+		nt.e[j] = t->e[i]; /* moves the key allocation, no re-strdup */
+		nt.n++;
+	}
+	free(t->e);
+	*t = nt;
+}
+
+/* Find-or-insert. Returned pointer is stable until the next insert. */
+static struct ent *tab_get(struct tab *t, const char *key) {
+	if (t->n * 10 >= t->cap * 7) tab_grow(t);
+	size_t m = t->cap - 1, i = fnv1a(key) & m;
+	while (t->e[i].key) {
+		if (strcmp(t->e[i].key, key) == 0) return &t->e[i];
+		i = (i + 1) & m;
+	}
+	t->e[i].key = strdup(key);
+	if (!t->e[i].key) die("out of memory");
+	t->n++;
+	return &t->e[i];
+}
+
+/* ------------------------------------------------------------------ *
  * perf_event_open plumbing.
  * ------------------------------------------------------------------ */
 
@@ -66,6 +129,7 @@ struct ring {
 static struct ring *rings;
 static int nrings;
 static uint64_t n_samples, n_lost;
+static struct tab flat;
 
 static long perf_open(struct perf_event_attr *a, pid_t pid, int cpu) {
 	return syscall(SYS_perf_event_open, a, pid, cpu, -1, 0UL);
@@ -81,6 +145,8 @@ static void ring_copy(struct ring *r, uint64_t off, void *dst, size_t n) {
 	memcpy(dst, r->data + o, first);
 	if (n > first) memcpy((char *)dst + first, r->data, n - first);
 }
+
+static void handle_sample(const unsigned char *p, size_t len);
 
 /* Drain one per-CPU buffer. Must never block: while we are not draining the
  * kernel keeps writing, and once data_head laps data_tail the kernel drops
@@ -101,13 +167,71 @@ static void drain(struct ring *r) {
 		ring_copy(r, tail, rec, h.size);
 		tail += h.size;
 		if (h.type == PERF_RECORD_SAMPLE)
-			n_samples++; /* contents are decoded in the next commit */
+			handle_sample(rec + sizeof h, h.size - sizeof h);
 		else if (h.type == PERF_RECORD_LOST && h.size >= sizeof h + 16)
 			n_lost += *(uint64_t *)(rec + sizeof h + 8);
 	}
 
 	__atomic_thread_fence(__ATOMIC_RELEASE); /* finish reading before publishing tail */
 	r->meta->data_tail = tail;
+}
+
+/* ------------------------------------------------------------------ *
+ * The unwinder.
+ * ------------------------------------------------------------------ */
+
+static uint64_t ld64(const unsigned char *p) {
+	uint64_t v;
+	memcpy(&v, p, 8);
+	return v;
+}
+
+/* Sample layout, in the fixed order documented in perf_event_open(2):
+ *   u64 ip                                      (PERF_SAMPLE_IP)
+ *   u32 pid, tid                                (PERF_SAMPLE_TID)
+ * Only the innermost address for now; stacks come later.
+ */
+static void handle_sample(const unsigned char *p, size_t len) {
+	if (len < 8 + 8) return; /* ip + pid/tid */
+	uint64_t ip = ld64(p);
+	n_samples++;
+
+	/* Raw addresses for now: naming them needs the target's mappings. */
+	char buf[32];
+	snprintf(buf, sizeof buf, "0x%" PRIx64, ip);
+	tab_get(&flat, buf)->self++;
+}
+
+/* ------------------------------------------------------------------ *
+ * Output.
+ * ------------------------------------------------------------------ */
+
+static int by_self(const void *a, const void *b) {
+	const struct ent *x = a, *y = b;
+	if (x->self != y->self) return x->self < y->self ? 1 : -1;
+	return strcmp(x->key, y->key);
+}
+
+static struct ent *sorted(struct tab *t, size_t *n) {
+	struct ent *v = xmalloc((t->n ? t->n : 1) * sizeof *v);
+	size_t k = 0;
+	for (size_t i = 0; i < t->cap; i++)
+		if (t->e[i].key) v[k++] = t->e[i];
+	qsort(v, k, sizeof *v, by_self);
+	*n = k;
+	return v;
+}
+
+static void emit_flat(FILE *o) {
+	size_t n;
+	struct ent *v = sorted(&flat, &n);
+	fprintf(o, "# flat profile: %" PRIu64 " samples\n", n_samples);
+	fprintf(o, "#   self%%     self  symbol\n");
+	for (size_t i = 0; i < n; i++) {
+		double s = n_samples ? 100.0 * v[i].self / n_samples : 0;
+		fprintf(o, "  %6.2f %8" PRIu64 "  %s\n", s, v[i].self, v[i].key);
+	}
+	free(v);
 }
 
 /* ------------------------------------------------------------------ */
@@ -131,19 +255,22 @@ static const char *sysctl_str(const char *path, int slot) {
 
 static void usage(void) {
 	fprintf(stderr,
-	        "usage: %s [-F HZ] -- ./prog [args...]\n"
-	        "  -F HZ      sample frequency, default 997\n",
+	        "usage: %s [-F HZ] [-o FILE] -- ./prog [args...]\n"
+	        "  -F HZ      sample frequency, default 997\n"
+	        "  -o FILE    write the profile here (default: stderr)\n",
 	        prog);
 	exit(2);
 }
 
 int main(int argc, char **argv) {
 	int hz = 997;
+	const char *out = NULL;
 	int i = 1;
 
 	for (; i < argc; i++) {
 		if (!strcmp(argv[i], "--")) { i++; break; }
 		else if (!strcmp(argv[i], "-F") && i + 1 < argc) hz = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
 		else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) usage();
 		else if (argv[i][0] == '-') die("unknown option %s (try -h)", argv[i]);
 		else break; /* bare program name, no -- */
@@ -233,6 +360,8 @@ int main(int argc, char **argv) {
 		return 3;
 	}
 
+	tab_init(&flat, 1 << 10);
+
 	/* Release the child; counting starts at its exec. */
 	if (write(pfd[1], "g", 1) != 1) die("write: %s", strerror(errno));
 	close(pfd[1]);
@@ -253,6 +382,14 @@ int main(int argc, char **argv) {
 	}
 	/* The child is gone but its last samples are still in the rings. */
 	for (int c = 0; c < nrings; c++) drain(&rings[c]);
+
+	FILE *o = stderr;
+	if (out) {
+		o = fopen(out, "w");
+		if (!o) die("%s: %s", out, strerror(errno));
+	}
+	emit_flat(o);
+	if (o != stderr) fclose(o);
 
 	/* Always on stderr: never on stdout, because a profiler that pollutes the
 	 * target's stdout is not transparent and cannot be dropped into a pipeline. */
