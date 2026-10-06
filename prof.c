@@ -1,13 +1,13 @@
 /* prof - a sampling CPU profiler built directly on perf_event_open(2).
  *
- * Usage: prof [-F HZ] [-o FILE] -- ./prog args...
+ * Usage: prof [-F HZ] [-o FILE] [--folded] -- ./prog args...
  *
  * What it does, end to end:
  *   fork/exec the target with the perf events already attached (enable_on_exec),
  *   take periodic samples of {RIP, RBP, RSP, top-of-stack bytes}, unwind the
  *   stack ourselves by walking the frame-pointer chain, resolve each address
  *   against the ELF .symtab/.dynsym of whatever file is mapped there, and
- *   aggregate into a flat profile.
+ *   aggregate into a flat profile plus collapsed ("folded") stacks.
  *
  * No libelf, no libunwind, no libdw. C11 + Linux headers only.
  *
@@ -80,8 +80,8 @@ static void *xmalloc(size_t n) {
 
 struct ent {
 	char *key;
-	uint64_t self;  /* samples whose innermost frame is this symbol */
-	uint64_t total; /* samples with this symbol anywhere in the stack    */
+	uint64_t self;  /* folded table: sample count. sym table: leaf samples. */
+	uint64_t total; /* sym table only: samples with this symbol anywhere.   */
 };
 
 struct tab {
@@ -357,7 +357,7 @@ struct ring {
 static struct ring *rings;
 static int nrings;
 static uint64_t n_samples, n_lost, n_trunc;
-static struct tab flat;
+static struct tab folded, flat;
 
 static long perf_open(struct perf_event_attr *a, pid_t pid, int cpu) {
 	return syscall(SYS_perf_event_open, a, pid, cpu, -1, 0UL);
@@ -468,11 +468,23 @@ static void handle_sample(const unsigned char *p, size_t len) {
 		bp = next;
 	}
 
-	/* Resolve every frame, then tally self against the leaf and total against
-	 * each distinct symbol in the stack. */
+	/* Resolve, build the folded key outermost-first, and tally the flat table. */
 	const char *names[MAX_DEPTH];
 	char bufs[MAX_DEPTH][64];
 	for (int i = 0; i < nf; i++) names[i] = resolve(fr[i], bufs[i], sizeof bufs[i]);
+
+	/* shortcut: stacks are keyed by their rendered string rather than by an
+	 * interned frame-id vector, so a stack longer than 4096 characters is
+	 * truncated and merges with its prefix. Upgrade path is a trie keyed on
+	 * symbol ids; the string is what flamegraph tools want anyway. */
+	char key[4096];
+	size_t kl = 0;
+	for (int i = nf - 1; i >= 0; i--) {
+		int w = snprintf(key + kl, sizeof key - kl, "%s%s", kl ? ";" : "", names[i]);
+		if (w < 0 || kl + w >= sizeof key) break;
+		kl += w;
+	}
+	tab_get(&folded, key)->self++;
 
 	tab_get(&flat, names[0])->self++;
 	for (int i = 0; i < nf; i++) {
@@ -517,6 +529,14 @@ static void emit_flat(FILE *o) {
 	free(v);
 }
 
+static void emit_folded(FILE *o) {
+	size_t n;
+	struct ent *v = sorted(&folded, &n);
+	for (size_t i = 0; i < n; i++)
+		fprintf(o, "%s %" PRIu64 "\n", v[i].key, v[i].self);
+	free(v);
+}
+
 /* ------------------------------------------------------------------ */
 
 /* So a failure message can quote the actual sysctl values instead of making the
@@ -538,20 +558,22 @@ static const char *sysctl_str(const char *path, int slot) {
 
 static void usage(void) {
 	fprintf(stderr,
-	        "usage: %s [-F HZ] [-o FILE] -- ./prog [args...]\n"
+	        "usage: %s [-F HZ] [-o FILE] [--folded] -- ./prog [args...]\n"
 	        "  -F HZ      sample frequency, default 997\n"
-	        "  -o FILE    write the profile here (default: stderr)\n",
+	        "  -o FILE    write the profile here (default: stderr)\n"
+	        "  --folded   collapsed stacks (\"main;foo;bar 42\") instead of a flat profile\n",
 	        prog);
 	exit(2);
 }
 
 int main(int argc, char **argv) {
-	int hz = 997;
+	int hz = 997, want_folded = 0;
 	const char *out = NULL;
 	int i = 1;
 
 	for (; i < argc; i++) {
 		if (!strcmp(argv[i], "--")) { i++; break; }
+		else if (!strcmp(argv[i], "--folded")) want_folded = 1;
 		else if (!strcmp(argv[i], "-F") && i + 1 < argc) hz = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
 		else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) usage();
@@ -646,6 +668,7 @@ int main(int argc, char **argv) {
 		return 3;
 	}
 
+	tab_init(&folded, 1 << 12);
 	tab_init(&flat, 1 << 10);
 
 	/* Release the child, then learn its address space. */
@@ -675,7 +698,8 @@ int main(int argc, char **argv) {
 		o = fopen(out, "w");
 		if (!o) die("%s: %s", out, strerror(errno));
 	}
-	emit_flat(o);
+	if (want_folded) emit_folded(o);
+	else emit_flat(o);
 	if (o != stderr) fclose(o);
 
 	/* Always on stderr: never on stdout, because a profiler that pollutes the
