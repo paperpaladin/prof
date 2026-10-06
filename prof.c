@@ -4,11 +4,20 @@
  *
  * What it does, end to end:
  *   fork/exec the target with the perf events already attached (enable_on_exec),
- *   take periodic samples of the instruction pointer, resolve each address
+ *   take periodic samples of {RIP, RBP, RSP, top-of-stack bytes}, unwind the
+ *   stack ourselves by walking the frame-pointer chain, resolve each address
  *   against the ELF .symtab/.dynsym of whatever file is mapped there, and
  *   aggregate into a flat profile.
  *
  * No libelf, no libunwind, no libdw. C11 + Linux headers only.
+ *
+ * shortcut: frame-pointer unwinding, not DWARF .eh_frame CFI. This is THE
+ * limitation of this profiler: it only produces correct stacks for code built
+ * with -fno-omit-frame-pointer. A distro libc/libstdc++ is built without frame
+ * pointers, so a sample taken inside memcpy() yields a chain that stops at
+ * memcpy (or worse, one bogus frame before we notice the chain is garbage).
+ * The upgrade path is parsing .eh_frame CFI and running the DWARF CFA state
+ * machine over the captured stack+regs, which is Milestone 1 item 1 in PLAN.md.
  */
 
 #define _GNU_SOURCE
@@ -34,8 +43,13 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 
-/* shortcut: a fixed ring size instead of a tuning knob. It must stay under
- * perf_event_mlock_kb per CPU. Upgrade path, if it ever bites: make it a flag. */
+/* shortcut: three fixed sizes instead of tuning knobs. MAX_DEPTH truncates very
+ * deep stacks, STACK_BYTES bounds how far back we can walk (deeper frames are
+ * counted in the "truncated stacks" figure rather than silently dropped), and
+ * BUF_PAGES must stay under perf_event_mlock_kb per CPU. Upgrade path, if any
+ * of them ever bites: make them flags. None has bitten yet. */
+#define MAX_DEPTH   128      /* frames per stack; deeper is truncated */
+#define STACK_BYTES 8192     /* user stack bytes copied per sample */
 #define BUF_PAGES   64       /* data pages per per-CPU ring buffer (power of 2) */
 
 static const char *prog = "prof";
@@ -67,6 +81,7 @@ static void *xmalloc(size_t n) {
 struct ent {
 	char *key;
 	uint64_t self;  /* samples whose innermost frame is this symbol */
+	uint64_t total; /* samples with this symbol anywhere in the stack    */
 };
 
 struct tab {
@@ -283,6 +298,12 @@ static int snapshot_maps(pid_t pid, const char *want) {
 	return nmaps;
 }
 
+static int in_text(uint64_t a) {
+	for (int i = 0; i < nmaps; i++)
+		if (a >= maps[i].start && a < maps[i].end) return 1;
+	return 0;
+}
+
 /* Greatest symbol whose address is <= a. Falls back to the module basename so
  * that an unresolved frame in a stripped library is still attributable. */
 static const char *resolve(uint64_t a, char *buf, size_t bufsz) {
@@ -319,6 +340,13 @@ static const char *resolve(uint64_t a, char *buf, size_t bufsz) {
  * perf_event_open plumbing.
  * ------------------------------------------------------------------ */
 
+/* sample_regs_user bitmask. The kernel delivers the selected registers in
+ * ascending bit order, so regs[0]=RBP, regs[1]=RSP, regs[2]=RIP. */
+#define REG_BP 6
+#define REG_SP 7
+#define REG_IP 8
+#define REGMASK ((1ULL << REG_BP) | (1ULL << REG_SP) | (1ULL << REG_IP))
+
 struct ring {
 	int fd;
 	struct perf_event_mmap_page *meta;
@@ -328,7 +356,7 @@ struct ring {
 
 static struct ring *rings;
 static int nrings;
-static uint64_t n_samples, n_lost;
+static uint64_t n_samples, n_lost, n_trunc;
 static struct tab flat;
 
 static long perf_open(struct perf_event_attr *a, pid_t pid, int cpu) {
@@ -389,15 +417,70 @@ static uint64_t ld64(const unsigned char *p) {
 /* Sample layout, in the fixed order documented in perf_event_open(2):
  *   u64 ip                                      (PERF_SAMPLE_IP)
  *   u32 pid, tid                                (PERF_SAMPLE_TID)
- * Only the innermost address for now; stacks come later.
+ *   u64 abi; u64 regs[popcount(regmask)]        (PERF_SAMPLE_REGS_USER)
+ *   u64 size; u8 data[size]; u64 dyn_size       (PERF_SAMPLE_STACK_USER)
  */
 static void handle_sample(const unsigned char *p, size_t len) {
-	if (len < 8 + 8) return; /* ip + pid/tid */
+	const unsigned char *end = p + len;
+	if (p + 8 + 8 > end) return;
 	uint64_t ip = ld64(p);
+	p += 8 + 8; /* ip, then pid+tid */
+
+	if (p + 8 > end) return;
+	uint64_t abi = ld64(p);
+	p += 8;
+	if (abi == PERF_SAMPLE_REGS_ABI_NONE) return; /* sampled in the kernel; we asked not to be */
+	if (p + 3 * 8 > end) return;
+	uint64_t bp = ld64(p), sp = ld64(p + 8), rip = ld64(p + 16);
+	p += 3 * 8;
+	if (rip) ip = rip;
+
+	if (p + 8 > end) return;
+	uint64_t ssize = ld64(p);
+	p += 8;
+	if (ssize > (uint64_t)(end - p)) return;
+	const unsigned char *stack = p;
+	uint64_t dyn = ssize >= 8 ? ld64(p + ssize) : 0; /* bytes actually captured */
+	if (dyn > ssize) dyn = ssize;
+
 	n_samples++;
 
-	char buf[64];
-	tab_get(&flat, resolve(ip, buf, sizeof buf))->self++;
+	/* Frame-pointer walk. Leaf first; reversed below for output. */
+	uint64_t fr[MAX_DEPTH];
+	int nf = 0;
+	fr[nf++] = ip;
+	for (int d = 0; d < MAX_DEPTH - 1; d++) {
+		if (bp < sp) break;
+		uint64_t off = bp - sp;
+		if (off + 16 > dyn) { /* the frame we need is past the bytes the kernel copied */
+			n_trunc++;
+			break;
+		}
+		uint64_t next = ld64(stack + off), ret = ld64(stack + off + 8);
+		/* A return address must land in a mapped executable region. On a libc
+		 * frame built without frame pointers, RBP holds live data instead of a
+		 * saved RBP, and this check is what stops us walking nonsense. */
+		if (!ret || !in_text(ret)) break;
+		/* ret points *after* the call instruction; step back so the address
+		 * attributes to the call site and not to whatever follows it. */
+		fr[nf++] = ret - 1;
+		if (next <= bp) break; /* the chain must strictly grow toward the stack base */
+		bp = next;
+	}
+
+	/* Resolve every frame, then tally self against the leaf and total against
+	 * each distinct symbol in the stack. */
+	const char *names[MAX_DEPTH];
+	char bufs[MAX_DEPTH][64];
+	for (int i = 0; i < nf; i++) names[i] = resolve(fr[i], bufs[i], sizeof bufs[i]);
+
+	tab_get(&flat, names[0])->self++;
+	for (int i = 0; i < nf; i++) {
+		int seen = 0;
+		for (int j = i + 1; j < nf; j++)
+			if (strcmp(names[i], names[j]) == 0) seen = 1;
+		if (!seen) tab_get(&flat, names[i])->total++;
+	}
 }
 
 /* ------------------------------------------------------------------ *
@@ -424,10 +507,12 @@ static void emit_flat(FILE *o) {
 	size_t n;
 	struct ent *v = sorted(&flat, &n);
 	fprintf(o, "# flat profile: %" PRIu64 " samples\n", n_samples);
-	fprintf(o, "#   self%%     self  symbol\n");
+	fprintf(o, "#   self%%     self   total%%    total  symbol\n");
 	for (size_t i = 0; i < n; i++) {
 		double s = n_samples ? 100.0 * v[i].self / n_samples : 0;
-		fprintf(o, "  %6.2f %8" PRIu64 "  %s\n", s, v[i].self, v[i].key);
+		double t = n_samples ? 100.0 * v[i].total / n_samples : 0;
+		fprintf(o, "  %6.2f %8" PRIu64 "  %6.2f %8" PRIu64 "  %s\n",
+		        s, v[i].self, t, v[i].total, v[i].key);
 	}
 	free(v);
 }
@@ -523,7 +608,10 @@ int main(int argc, char **argv) {
 		                       * cannot unwind kernel stacks anyway */
 		a.exclude_hv = 1;
 		a.inherit = 1; /* follow threads and forked children */
-		a.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID;
+		a.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID |
+		                PERF_SAMPLE_REGS_USER | PERF_SAMPLE_STACK_USER;
+		a.sample_regs_user = REGMASK;
+		a.sample_stack_user = STACK_BYTES;
 
 		/* One event per CPU rather than one per-task event: the kernel refuses
 		 * to mmap a per-task event with inherit=1 (all children would share one
@@ -592,8 +680,9 @@ int main(int argc, char **argv) {
 
 	/* Always on stderr: never on stdout, because a profiler that pollutes the
 	 * target's stdout is not transparent and cannot be dropped into a pipeline. */
-	fprintf(stderr, "%s: %" PRIu64 " samples, %" PRIu64 " lost, %s @ %d Hz, %d/%d cpus\n",
-	        prog, n_samples, n_lost, evname, hz, nrings, ncpu);
+	fprintf(stderr, "%s: %" PRIu64 " samples, %" PRIu64 " lost, %" PRIu64
+	                " truncated stacks, %s @ %d Hz, %d/%d cpus\n",
+	        prog, n_samples, n_lost, n_trunc, evname, hz, nrings, ncpu);
 	if (n_samples == 0)
 		fprintf(stderr, "%s: no samples -- target too short-lived, or off-CPU the whole time\n", prog);
 
