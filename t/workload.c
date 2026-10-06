@@ -27,13 +27,23 @@ static volatile double sink;
 
 #define UNIT 3000000L
 
+/* The volatile local is not decoration. GCC 14 on x86-64 gives a leaf function
+ * no stack frame at all when it needs no stack slot -- and therefore no saved
+ * RBP -- even under -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer. A
+ * frame-pointer unwinder sampling inside such a leaf sees the *caller's* frame
+ * pointer and so silently loses one level of the call chain (we measured
+ * exactly that: main;level1;hot, with level2 missing). Forcing one stack slot
+ * forces the prologue back. This is a limitation of FP unwinding, documented in
+ * README.md under "what does not work", not something the workload hides. */
 #define BURN(units)                                    \
 	do {                                           \
-		double x = 1.0;                        \
+		volatile double keep = 1.0;            \
+		double x = keep;                       \
 		long n = (units) * UNIT;               \
 		for (long i = 0; i < n; i++)           \
 			x = x * 0.9999 + 0.5;          \
-		sink = x;                              \
+		keep = x;                              \
+		sink = keep;                           \
 	} while (0)
 
 __attribute__((noinline)) static void cold(void) { BURN(1); }
