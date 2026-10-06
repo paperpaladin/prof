@@ -152,5 +152,34 @@ else
 	    "saw $outer_saw -- an incomplete /proc/PID/maps truncates the walk"
 fi
 
+# --- 6. the sampler actually samples periodically ------------------------
+# Catches the classic broken profiler that fires once (or once per run) and then
+# extrapolates: neither frequency nor duration would move the sample count.
+$PROF -F 499  -o "$TMP/lo"   -- $WL 1 >/dev/null 2>"$TMP/lo.err"
+$PROF -F 1997 -o "$TMP/hi"   -- $WL 1 >/dev/null 2>"$TMP/hi.err"
+$PROF -F 499  -o "$TMP/long" -- $WL 2 >/dev/null 2>"$TMP/long.err"
+lo=$(samples "$TMP/lo.err"); hi=$(samples "$TMP/hi.err"); lg=$(samples "$TMP/long.err")
+: "${lo:=0}" "${hi:=0}" "${lg:=0}"
+
+if [ "$lo" -gt 0 ] && num "$hi > 1.6 * $lo"; then
+	ok "scaling: 4x the frequency gave $(awk "BEGIN{printf \"%.2f\", $hi/$lo}")x the samples (499Hz=$lo, 1997Hz=$hi)"
+else
+	bad "scaling: raising the frequency must raise the sample count" "499Hz=$lo 1997Hz=$hi"
+fi
+if [ "$lo" -gt 0 ] && num "$lg > 1.5 * $lo"; then
+	ok "scaling: 2x the run time gave $(awk "BEGIN{printf \"%.2f\", $lg/$lo}")x the samples (1 rep=$lo, 2 reps=$lg)"
+else
+	bad "scaling: doubling the run time must roughly double the sample count" "1rep=$lo 2reps=$lg"
+fi
+
+# --- 7. no silent data loss ---------------------------------------------
+lost=$(sed -n 's/.*samples, \([0-9]*\) lost.*/\1/p' "$TMP/hi.err" | tail -1)
+: "${lost:=0}"
+if [ "$lost" -eq 0 ]; then
+	ok "ring buffer: 0 samples lost at 1997 Hz"
+else
+	bad "ring buffer: samples were dropped at 1997 Hz" "$lost lost -- drain loop is too slow"
+fi
+
 printf '\n%d passed, %d failed, %d skipped\n' "$P" "$F" "$S"
 [ "$F" -eq 0 ]
