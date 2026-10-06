@@ -4,8 +4,8 @@
  *
  * What it does, end to end:
  *   fork/exec the target with the perf events already attached (enable_on_exec),
- *   take periodic samples of the instruction pointer, and aggregate them into
- *   a flat profile of addresses.
+ *   take periodic samples of the instruction pointer, attribute each address
+ *   to the object mapped there, and aggregate into a flat profile.
  *
  * No libelf, no libunwind, no libdw. C11 + Linux headers only.
  */
@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -116,6 +117,80 @@ static struct ent *tab_get(struct tab *t, const char *key) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Address space of the target: its executable mappings.
+ * ------------------------------------------------------------------ */
+
+struct map {
+	uint64_t start, end, pgoff;
+	char path[PATH_MAX];
+};
+
+static struct map maps[512];
+static int nmaps;
+
+static const char *base_name(const char *p) {
+	const char *s = strrchr(p, '/');
+	return s ? s + 1 : p;
+}
+
+/* Snapshot the target's executable mappings. Polls until the exec'd image
+ * itself shows up, because we attach the perf events before exec() and would
+ * otherwise race and snapshot our own (pre-exec) address space.
+ * shortcut: one snapshot only. A library dlopen()ed later is invisible, and
+ * the fix is to consume PERF_RECORD_MMAP2 records from the ring buffer. */
+static int snapshot_maps(pid_t pid, const char *want) {
+	char mp[64], want_real[PATH_MAX];
+	snprintf(mp, sizeof mp, "/proc/%d/maps", (int)pid);
+	if (!realpath(want, want_real)) want_real[0] = 0;
+
+	for (int tries = 0; tries < 2000; tries++) {
+		FILE *f = fopen(mp, "r");
+		if (!f) return 0; /* already gone */
+		char line[PATH_MAX + 128];
+		int found = 0;
+		nmaps = 0;
+		while (fgets(line, sizeof line, f)) {
+			uint64_t s, e, off;
+			char perms[8], path[PATH_MAX];
+			unsigned d1, d2;
+			unsigned long ino;
+			path[0] = 0;
+			if (sscanf(line, "%" SCNx64 "-%" SCNx64 " %7s %" SCNx64 " %x:%x %lu %[^\n]",
+			           &s, &e, perms, &off, &d1, &d2, &ino, path) < 7)
+				continue;
+			if (perms[2] != 'x') continue;
+			char *p = path;
+			while (*p == ' ') p++;
+			if (!*p || *p == '[') continue; /* [vdso], [vsyscall]: nothing to parse */
+			if (nmaps == (int)(sizeof maps / sizeof *maps)) break;
+			maps[nmaps].start = s;
+			maps[nmaps].end = e;
+			maps[nmaps].pgoff = off;
+			snprintf(maps[nmaps].path, PATH_MAX, "%s", p);
+			nmaps++;
+			if (want_real[0] && strcmp(p, want_real) == 0) found = 1;
+		}
+		fclose(f);
+		if (found || !want_real[0]) break;
+		usleep(500);
+	}
+
+	return nmaps;
+}
+
+/* Attribute an address to the file mapped there, as module+offset. Real symbol
+ * names come next; this already tells you which object the time is in. */
+static const char *resolve(uint64_t a, char *buf, size_t bufsz) {
+	for (int i = 0; i < nmaps; i++)
+		if (a >= maps[i].start && a < maps[i].end) {
+			snprintf(buf, bufsz, "%s+0x%" PRIx64, base_name(maps[i].path), a - maps[i].start);
+			return buf;
+		}
+	snprintf(buf, bufsz, "0x%" PRIx64, a);
+	return buf;
+}
+
+/* ------------------------------------------------------------------ *
  * perf_event_open plumbing.
  * ------------------------------------------------------------------ */
 
@@ -196,10 +271,8 @@ static void handle_sample(const unsigned char *p, size_t len) {
 	uint64_t ip = ld64(p);
 	n_samples++;
 
-	/* Raw addresses for now: naming them needs the target's mappings. */
-	char buf[32];
-	snprintf(buf, sizeof buf, "0x%" PRIx64, ip);
-	tab_get(&flat, buf)->self++;
+	char buf[64];
+	tab_get(&flat, resolve(ip, buf, sizeof buf))->self++;
 }
 
 /* ------------------------------------------------------------------ *
@@ -362,9 +435,10 @@ int main(int argc, char **argv) {
 
 	tab_init(&flat, 1 << 10);
 
-	/* Release the child; counting starts at its exec. */
+	/* Release the child, then learn its address space. */
 	if (write(pfd[1], "g", 1) != 1) die("write: %s", strerror(errno));
 	close(pfd[1]);
+	snapshot_maps(pid, target[0]);
 
 	struct pollfd *pfds = xmalloc(nrings * sizeof *pfds);
 	for (int c = 0; c < nrings; c++) {
