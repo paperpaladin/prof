@@ -122,7 +122,7 @@ is worth having in history rather than described from memory.
       why: half of naming an address is knowing which file is mapped there, and
       `module+offset` survives ASLR where a raw address does not.
 - [x] `elf` -- hand-rolled `.symtab`/`.dynsym` reader, per-`PT_LOAD` load bias,
-      address→symbol binary search.
+      address-to-symbol binary search.
       why: a load bias computed as `start - pgoff` is wrong for most segments
       under `-z separate-code`, and the failure mode is naming the function a
       page away -- invisible in the output.
