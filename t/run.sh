@@ -112,8 +112,13 @@ else
 	bad "unwind: folded output contains main;level1;level2;hot" "$(head -3 "$TMP/fold")"
 fi
 # A folded line is "stack count" and nothing else, or flamegraph tools choke.
-if awk '{ if (NF != 2 || $2 !~ /^[0-9]+$/) exit 1 }' "$TMP/fold"; then
-	ok "unwind: folded output is well formed ('stack count' per line)"
+#
+# The non-emptiness test is not decoration: awk over zero records runs no
+# rules and exits 0, so this passed on an empty file -- a loop that asserts
+# nothing when there is nothing to assert about.
+if [ "$(wc -l < "$TMP/fold")" -gt 0 ] &&
+   awk '{ if (NF != 2 || $2 !~ /^[0-9]+$/) exit 1 }' "$TMP/fold"; then
+	ok "unwind: folded output is well formed ('stack count' per line, $(wc -l < "$TMP/fold") lines)"
 else
 	bad "unwind: folded output is well formed" "$(head -3 "$TMP/fold")"
 fi
@@ -142,8 +147,21 @@ for r in 1 2 3; do
 	$PROF --folded -o "$TMP/f$r" -- $WL 1 >/dev/null 2>&1
 	o=$(awk -F';' '{print $1}' "$TMP/f$r" | sort -u)
 	n=$(printf '%s\n' "$o" | wc -l)
+	# wc -l, not `grep -c . || echo 0`: grep -c prints 0 AND exits 1 when
+	# nothing matches, so the `||` appends a second 0 and the variable
+	# becomes "0\n0" -- which makes `[ -gt ]` an integer-expression error
+	# rather than a comparison. It fails in the right direction by
+	# accident, which is not the same as working.
+	nlines=$(wc -l < "$TMP/f$r")
 	outer_saw="$outer_saw[$(printf '%s' "$o" | tr '\n' ',')]"
-	{ [ "$n" = 1 ] && [ "$o" != main ]; } || outer_ok=0
+	# nlines first, and it is the whole point. On an EMPTY file o is the
+	# empty string, `printf '%s\n' "" | wc -l` is 1, and "" != main is
+	# true -- so the three conditions below were all satisfied by prof
+	# having produced no output at all, and the diagnostic printed "[]".
+	# This is the suite's defence against non-deterministic stack
+	# truncation, which the README ranks as strictly worse than truncating
+	# always, and it was green on zero stacks.
+	{ [ "$nlines" -gt 0 ] && [ "$n" = 1 ] && [ "$o" != main ]; } || outer_ok=0
 done
 if [ "$outer_ok" = 1 ]; then
 	ok "maps: every stack reaches past main into the entry frame $outer_saw"
@@ -161,12 +179,24 @@ $PROF -F 499  -o "$TMP/long" -- $WL 2 >/dev/null 2>"$TMP/long.err"
 lo=$(samples "$TMP/lo.err"); hi=$(samples "$TMP/hi.err"); lg=$(samples "$TMP/long.err")
 : "${lo:=0}" "${hi:=0}" "${lg:=0}"
 
-if [ "$lo" -gt 0 ] && num "$hi > 1.6 * $lo"; then
+# 3.0 and 1.75, not 1.6 and 1.5.
+#
+# The claim in README and PLAN is "4x the frequency gives ~4x the samples,
+# 2x the run time gives ~2x the samples". The bars were 1.6 and 1.5, so a
+# sampler realising 40% of the requested frequency increase passed -- and
+# the pass message prints the measured ratio, so the output read as though
+# the stated claim were being enforced. Measured here: 4.11x and 2.00x.
+#
+# Still generous, deliberately. This is a sampling profiler and the ratio
+# is a claim about this CPU under this load; the README says the suite
+# fails under CPU competition. 3.0 against an observed 4.11 leaves room
+# for that without leaving room for a sampler that barely scales at all.
+if [ "$lo" -gt 0 ] && num "$hi > 3.0 * $lo"; then
 	ok "scaling: 4x the frequency gave $(awk "BEGIN{printf \"%.2f\", $hi/$lo}")x the samples (499Hz=$lo, 1997Hz=$hi)"
 else
 	bad "scaling: raising the frequency must raise the sample count" "499Hz=$lo 1997Hz=$hi"
 fi
-if [ "$lo" -gt 0 ] && num "$lg > 1.5 * $lo"; then
+if [ "$lo" -gt 0 ] && num "$lg > 1.75 * $lo"; then
 	ok "scaling: 2x the run time gave $(awk "BEGIN{printf \"%.2f\", $lg/$lo}")x the samples (1 rep=$lo, 2 reps=$lg)"
 else
 	bad "scaling: doubling the run time must roughly double the sample count" "1rep=$lo 2reps=$lg"

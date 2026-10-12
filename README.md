@@ -34,6 +34,8 @@ Three separate copies of the same loop, with a 10x and 100x iteration count. Not
 4. **The chain `main;level1;level2;hot` appears in the folded output**, and every folded line is exactly `stack count` so flamegraph tooling can eat it.
 5. **The address space is known completely.** Symbols must still resolve when the target execs a second image (`sh -c "exec t/workload 1"`, the shape of every wrapper script), and every stack must reach past `main` into the C runtime entry frame. Both catch an incomplete `/proc/PID/maps` snapshot, which truncates stacks *non-deterministically* -- strictly worse than truncating them always, because the two profiles are indistinguishable.
 6. **The sampler really samples.** 4x the frequency gives ~4x the samples; 2x the run time gives ~2x the samples. This is the test that catches a "profiler" that fires once and extrapolates -- the single most embarrassing possible bug here, and invisible to every other check.
+
+   Asserted at **3.0x and 1.75x**, not at 4x and 2x, because this is a sampling profiler and the ratio is a claim about this CPU under this load. Measured here: 4.11x and 2.00x. The bars were **1.6x and 1.5x** until an audit pointed out that a sampler realising 40% of the requested frequency increase would pass -- while the pass message prints the measured ratio, so the output read as though the stated claim were being enforced. Stating both numbers because the gap between what is claimed and what is asserted is the reader's business.
 7. **Nothing was dropped.** `PERF_RECORD_LOST` must report zero at 1997 Hz, i.e. the drain loop keeps up.
 
 Measured on this machine: `hot` 90.3% of samples, `hot/warm` 10.2x, `warm` 72 vs `cold` 7 samples, frequency scaling 3.85x for 4x Hz, duration scaling 1.88x for 2x reps.
@@ -114,7 +116,33 @@ Two kernel details that shaped the design, both discovered by hitting them:
 - The event is opened **per CPU** with `inherit=1` and `pid=child`, not as a single per-task event. `perf_mmap()` refuses a per-task event with `inherit=1` (`EINVAL`) because all inherited children would share one ring buffer. Per-CPU events are how `perf record` follows threads, and verified here: a two-thread target yields both `main;spin` and `th;spin`.
 - The executable mappings are re-read from `/proc/PID/maps` on every drain iteration rather than snapshotted once. A single early snapshot races `ld.so`: you see the main binary but not yet libc, every return address into libc then looks unmapped, and stacks truncate **non-deterministically**. It also has to happen while the target is alive, since `/proc/PID/maps` disappears the instant it exits.
 
-### What does not work
+### Two assertions used to pass on no output at all
+
+Both are the suite's defences against prof producing nothing, and both were
+satisfied by prof producing nothing.
+
+`maps: every stack reaches past main` compared the set of outermost frames
+and required exactly one, not `main`. On an empty folded file the set is the
+empty string, `printf '%s\n' "" | wc -l` is **1**, and `"" != main` is true
+-- so all three conditions held, and the diagnostic helpfully printed `[]`.
+This is the check the README ranks as guarding against the worst failure
+mode here, non-deterministic stack truncation, and it was green on zero
+stacks.
+
+`unwind: folded output is well formed` ran an `awk` program over the file.
+awk over zero records runs no rules and exits 0.
+
+Both now require the file to be non-empty first, and both report the line
+count so the number is in the output rather than implied.
+
+The spelling of that guard matters too. `grep -c . file || echo 0` looks
+right and is wrong: `grep -c` prints `0` **and** exits 1 when nothing
+matches, so the `||` appends a second zero, the variable becomes `0\n0`, and
+`[ -gt ]` becomes an integer-expression error. It fails in the right
+direction by accident, which is not the same as working. `wc -l < file`
+does not have that problem.
+
+## What does not work
 
 - **Frame pointers are required.** Stack unwinding walks the saved-RBP chain, so it only works on code built with `-fno-omit-frame-pointer`. On an optimised binary the stacks collapse to depth 1. Live demonstration -- the same workload at `-O2 -fomit-frame-pointer`:
 
