@@ -203,9 +203,20 @@ else
 fi
 
 # --- 7. no silent data loss ---------------------------------------------
+# `: "${lost:=0}"` turned "the sed found nothing" into "zero samples lost",
+# which is the answer this assertion wants -- so the check passed whenever it
+# could not read prof's report. Proved by injecting n_lost = 7 *and* renaming
+# the word "lost" to "dropped" in prof.c's summary: the line printed
+# "ok ring buffer: 0 samples lost at 1997 Hz" with seven samples genuinely
+# lost. (Injecting n_lost alone is correctly caught; it is the pair that
+# hides.) The two sibling defaults in this file fail in the safe direction;
+# this one did not.
 lost=$(sed -n 's/.*samples, \([0-9]*\) lost.*/\1/p' "$TMP/hi.err" | tail -1)
-: "${lost:=0}"
-if [ "$lost" -eq 0 ]; then
+if [ -z "$lost" ]; then
+	bad "ring buffer: 0 samples lost at 1997 Hz" \
+	    "could not find a 'N samples, M lost' line in prof's output" \
+	    "$(tail -3 "$TMP/hi.err")"
+elif [ "$lost" -eq 0 ]; then
 	ok "ring buffer: 0 samples lost at 1997 Hz"
 else
 	bad "ring buffer: samples were dropped at 1997 Hz" "$lost lost -- drain loop is too slow"

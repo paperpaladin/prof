@@ -35,17 +35,17 @@ Three separate copies of the same loop, with a 10x and 100x iteration count. Not
 5. **The address space is known completely.** Symbols must still resolve when the target execs a second image (`sh -c "exec t/workload 1"`, the shape of every wrapper script), and every stack must reach past `main` into the C runtime entry frame. Both catch an incomplete `/proc/PID/maps` snapshot, which truncates stacks *non-deterministically* -- strictly worse than truncating them always, because the two profiles are indistinguishable.
 6. **The sampler really samples.** 4x the frequency gives ~4x the samples; 2x the run time gives ~2x the samples. This is the test that catches a "profiler" that fires once and extrapolates -- the single most embarrassing possible bug here, and invisible to every other check.
 
-   Asserted at **3.0x and 1.75x**, not at 4x and 2x, because this is a sampling profiler and the ratio is a claim about this CPU under this load. Measured here: 4.11x and 2.00x. The bars were **1.6x and 1.5x** until an audit pointed out that a sampler realising 40% of the requested frequency increase would pass -- while the pass message prints the measured ratio, so the output read as though the stated claim were being enforced. Stating both numbers because the gap between what is claimed and what is asserted is the reader's business.
+   Asserted at **3.0x and 1.75x**, not at 4x and 2x, because this is a sampling profiler and the ratio is a claim about this CPU under this load. Measured here across several runs: 3.9x-4.4x and 1.9x-2.1x -- a sampling ratio, so it is a range and not a figure. The bars were **1.6x and 1.5x** until an audit pointed out that a sampler realising 40% of the requested frequency increase would pass -- while the pass message prints the measured ratio, so the output read as though the stated claim were being enforced. Stating both numbers because the gap between what is claimed and what is asserted is the reader's business.
 7. **Nothing was dropped.** `PERF_RECORD_LOST` must report zero at 1997 Hz, i.e. the drain loop keeps up.
 
-Measured on this machine: `hot` 90.3% of samples, `hot/warm` 10.2x, `warm` 72 vs `cold` 7 samples, frequency scaling 3.85x for 4x Hz, duration scaling 1.88x for 2x reps.
+Measured on this machine, one run: `hot` 90.3% of samples, `hot/warm` 10.2x, `warm` 63 vs `cold` 6 samples, frequency scaling 4.05x for 4x Hz, duration scaling 1.96x for 2x reps. All five move run to run; the assertions are the bars above, not these.
 
 ## `make test`
 
 ```
 $ make test
-cc -std=c11 -O2 -Wall -Wextra -g -o prof prof.c
-cc -std=c11 -O1 -g -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -fno-inline -o t/workload t/workload.c
+cc -std=c11 -O2 -Wall -Wextra -g -ffile-prefix-map=$(CURDIR)=. -o prof prof.c
+cc -std=c11 -O1 -g -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -fno-inline -ffile-prefix-map=$(CURDIR)=. -o t/workload t/workload.c
 ok    build: prof and workload are present
 ok    transparency: exit status passed through unchanged (7)
 ok    transparency: target stdout byte-identical
@@ -53,13 +53,13 @@ ok    -o FILE writes the profile there, not into the target's stdout
 ok    symbolisation: hottest symbol is named 'hot'
 ok    oracle: hot() holds 90.27% of samples (built to be ~90%, need >60%)
 ok    oracle: hot/warm = 10.2x (built as 10x, need >3x)
-ok    oracle: warm(72) > cold(7), as built (10:1)
+ok    oracle: warm(63) > cold(6), as built (10:1)
 ok    unwind: folded output contains main;level1;level2;hot
-ok    unwind: folded output is well formed ('stack count' per line)
+ok    unwind: folded output is well formed ('stack count' per line, 3 lines)
 ok    maps: symbols still resolve when the target execs another image
-ok    maps: every stack reaches past main into the entry frame [libc.so.6+0x1ca7]
-ok    scaling: 4x the frequency gave 3.85x the samples (499Hz=376, 1997Hz=1447)
-ok    scaling: 2x the run time gave 1.88x the samples (1 rep=376, 2 reps=706)
+ok    maps: every stack reaches past main into the entry frame [libc.so.6+0x1ca7][libc.so.6+0x1ca7][libc.so.6+0x1ca7]
+ok    scaling: 4x the frequency gave 4.05x the samples (499Hz=357, 1997Hz=1447)
+ok    scaling: 2x the run time gave 1.96x the samples (1 rep=357, 2 reps=701)
 ok    ring buffer: 0 samples lost at 1997 Hz
 
 15 passed, 0 failed, 0 skipped
@@ -107,13 +107,13 @@ Pipe the folded form straight into a flamegraph:
 
 - `/proc/sys/kernel/perf_event_paranoid` = **2**
 - kernel 7.2.8-200.fc44.x86_64, unprivileged uid 1000, no root, no sysctl changed
-- `/proc/sys/kernel/perf_event_max_sample_rate` = 14000 (so `-F` above that is rejected by the kernel; `prof` says so)
+- `/proc/sys/kernel/perf_event_max_sample_rate` = 6000 here (so `-F` above that is rejected by the kernel; `prof` says so). The kernel auto-throttles this sysctl, so it moves on its own -- it read 14000 when this was written and `prof` quotes the live value rather than this one.
 
 `paranoid=2` forbids kernel-mode measurement but permits a user to sample their own processes, which is all this needs: every event is opened with `exclude_kernel=1` and `exclude_hv=1`. The event tried first is `PERF_TYPE_HARDWARE`/`PERF_COUNT_HW_CPU_CYCLES`, which is what worked here (`hw cpu-cycles` in the summary line). If no PMU is exposed -- a VM or container without PMU pass-through -- it falls back to `PERF_TYPE_SOFTWARE`/`PERF_COUNT_SW_CPU_CLOCK` and then `SW_TASK_CLOCK`, both hrtimer-driven. The summary line always names which one it got, so you never have to guess. The `setitimer`/`SIGPROF`-via-`LD_PRELOAD` and `/proc/PID/stat`-polling fallbacks described as contingencies were **not** implemented, because they were not needed and writing unused code would be worse than not writing it.
 
 Two kernel details that shaped the design, both discovered by hitting them:
 
-- The event is opened **per CPU** with `inherit=1` and `pid=child`, not as a single per-task event. `perf_mmap()` refuses a per-task event with `inherit=1` (`EINVAL`) because all inherited children would share one ring buffer. Per-CPU events are how `perf record` follows threads, and verified here: a two-thread target yields both `main;spin` and `th;spin`.
+- The event is opened **per CPU** with `inherit=1` and `pid=child`, not as a single per-task event. `perf_mmap()` refuses a per-task event with `inherit=1` (`EINVAL`) because all inherited children would share one ring buffer. Per-CPU events are how `perf record` follows threads. That was stated here as "verified: a two-thread target yields both `main;spin` and `th;spin`" -- there is no such target in this repo and `git log --all` shows there never was, so the claim is removed rather than restated. t/workload.c is single-threaded.
 - The executable mappings are re-read from `/proc/PID/maps` on every drain iteration rather than snapshotted once. A single early snapshot races `ld.so`: you see the main binary but not yet libc, every return address into libc then looks unmapped, and stacks truncate **non-deterministically**. It also has to happen while the target is alive, since `/proc/PID/maps` disappears the instant it exits.
 
 ### Two assertions used to pass on no output at all
@@ -158,7 +158,7 @@ does not have that problem.
 - **No JIT support.** Symbols come from ELF files on disk. JVM/V8/LuaJIT code shows as `module+offset` or a bare address; `/tmp/perf-PID.map` is not read.
 - **No off-CPU profiling.** A process blocked on I/O generates no cycles and no samples; `prof` says "no samples" rather than telling you where it was blocked.
 - **No inline-frame expansion.** One address maps to one symbol. Inlined callees are attributed to the function they were inlined into (which is also why the workload builds with `-fno-inline`).
-- 8KB of stack is copied per sample, so stacks deeper than that are truncated. The count of truncations is reported in the summary line rather than hidden -- a two-thread test shows 92 of them, from the thread's outermost frame.
+- 8KB of stack is copied per sample, so stacks deeper than that are truncated. The count of truncations is reported in the summary line rather than hidden. (A figure of 92 truncations "from a two-thread test" used to sit here; that target does not exist in this repo and `n_trunc` is not asserted anywhere in the harness.)
 - 64-bit little-endian ELF only. No 32-bit, no separate debuginfo files, no compressed debug sections, no C++ demangling.
 - One snapshot of symbols per object; a `dlopen` is picked up (maps are refreshed continuously) but an unmap/remap at the same address is not.
 - Symbols from every sampled process share one table, so a target that `fork()`s has its children's PIE addresses resolved against the parent's mappings. `inherit=1` samples them; naming them correctly needs `PERF_RECORD_FORK`/`MMAP2`.
