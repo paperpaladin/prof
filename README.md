@@ -91,7 +91,7 @@ libc.so.6+0x1ca7;main;cold 7
 prof: 769 samples, 0 lost, 0 truncated stacks, hw cpu-cycles @ 997 Hz, 8/8 cpus
 ```
 
-`self` is samples whose innermost frame is this symbol; `total` is samples with this symbol anywhere in the stack. The profile goes to **stderr** unless you pass `-o FILE`, and never to stdout, that is what makes `prof, ./prog | consumer` safe. `libc.so.6+0x1ca7` is `__libc_start_call_main`, which a stripped distro libc does not export; `module+offset` is the honest answer there.
+`self` is samples whose innermost frame is this symbol; `total` is samples with this symbol anywhere in the stack. The profile goes to stderr unless you pass `-o FILE`, and never to stdout, that is what makes `prof, ./prog | consumer` safe. `libc.so.6+0x1ca7` is `__libc_start_call_main`, which a stripped distro libc does not export; `module+offset` is the honest answer there.
 
 Pipe the folded form straight into a flamegraph:
 
@@ -101,18 +101,18 @@ Pipe the folded form straight into a flamegraph:
 
 ## Which sampling mechanism this actually uses
 
-`perf_event_open(2)` directly, for real, **no fallback was needed on this kernel.** Measured here:
+`perf_event_open(2)` directly, for real, no fallback was needed on this kernel. Measured here:
 
-- `/proc/sys/kernel/perf_event_paranoid` = **2**
+- `/proc/sys/kernel/perf_event_paranoid` = 2
 - kernel 7.2.8-200.fc44.x86_64, unprivileged uid 1000, no root, no sysctl changed
 - `/proc/sys/kernel/perf_event_max_sample_rate` = 6000 here (so `-F` above that is rejected by the kernel; `prof` says so). The kernel auto-throttles this sysctl, so it moves on its own, it read 14000 when this was written and `prof` quotes the live value, not this one.
 
-`paranoid=2` forbids kernel-mode measurement but permits a user to sample their own processes, which is all this needs: every event is opened with `exclude_kernel=1` and `exclude_hv=1`. The event tried first is `PERF_TYPE_HARDWARE`/`PERF_COUNT_HW_CPU_CYCLES`, which is what worked here (`hw cpu-cycles` in the summary line). If no PMU is exposed: a VM or container without PMU pass-through, it falls back to `PERF_TYPE_SOFTWARE`/`PERF_COUNT_SW_CPU_CLOCK` and then `SW_TASK_CLOCK`, both hrtimer-driven. The summary line always names which one it got, so you never have to guess. The `setitimer`/`SIGPROF`-via-`LD_PRELOAD` and `/proc/PID/stat`-polling fallbacks described as contingencies were **not** implemented, because they were not needed and writing unused code would be worse than not writing it.
+`paranoid=2` forbids kernel-mode measurement but permits a user to sample their own processes, which is all this needs: every event is opened with `exclude_kernel=1` and `exclude_hv=1`. The event tried first is `PERF_TYPE_HARDWARE`/`PERF_COUNT_HW_CPU_CYCLES`, which is what worked here (`hw cpu-cycles` in the summary line). If no PMU is exposed: a VM or container without PMU pass-through, it falls back to `PERF_TYPE_SOFTWARE`/`PERF_COUNT_SW_CPU_CLOCK` and then `SW_TASK_CLOCK`, both hrtimer-driven. The summary line always names which one it got, so you never have to guess. The `setitimer`/`SIGPROF`-via-`LD_PRELOAD` and `/proc/PID/stat`-polling fallbacks described as contingencies were not implemented, because they were not needed and writing unused code would be worse than not writing it.
 
 Two kernel details that shaped the design, both discovered by hitting them:
 
 - The event is opened **per CPU** with `inherit=1` and `pid=child`, not as a single per-task event. `perf_mmap()` refuses a per-task event with `inherit=1` (`EINVAL`) because all inherited children would share one ring buffer. Per-CPU events are how `perf record` follows threads. That was stated here as "verified: a two-thread target yields both `main;spin` and `th;spin`", there is no such target in this repo and `git log --all` shows there never was, so the claim is removed, not restated. t/workload.c is single-threaded.
-- The executable mappings are re-read from `/proc/PID/maps` on every drain iteration, not snapshotted once. A single early snapshot races `ld.so`: you see the main binary but not yet libc, every return address into libc then looks unmapped, and stacks truncate **non-deterministically**. It also has to happen while the target is alive, since `/proc/PID/maps` disappears the instant it exits.
+- The executable mappings are re-read from `/proc/PID/maps` on every drain iteration, not snapshotted once. A single early snapshot races `ld.so`: you see the main binary but not yet libc, every return address into libc then looks unmapped, and stacks truncate non-deterministically. It also has to happen while the target is alive, since `/proc/PID/maps` disappears the instant it exits.
 
 ## Two assertions used to pass on no output at all
 
@@ -121,7 +121,7 @@ satisfied by prof producing nothing.
 
 `maps: every stack reaches past main` compared the set of outermost frames
 and required exactly one, not `main`. On an empty folded file the set is the
-empty string, `printf '%s\n' "" | wc -l` is **1**, and `"" != main` is true,
+empty string, `printf '%s\n' "" | wc -l` is 1, and `"" != main` is true,
 so all three conditions held, and the diagnostic helpfully printed `[]`.
 This is the check the README ranks as guarding against the worst failure
 mode here, non-deterministic stack truncation, and it was green on zero
@@ -134,7 +134,7 @@ Both now require the file to be non-empty first, and both report the line
 count so the number is in the output, not implied.
 
 The spelling of that guard matters too. `grep -c . file || echo 0` looks
-right and is wrong: `grep -c` prints `0` **and** exits 1 when nothing
+right and is wrong: `grep -c` prints `0` and exits 1 when nothing
 matches, so the `||` appends a second zero, the variable becomes `0\n0`, and
 `[ -gt ]` becomes an integer-expression error. It fails in the right
 direction by accident, which is not the same as working. `wc -l < file`
@@ -150,7 +150,7 @@ does not have that problem.
   cold 6
   ```
 
-  The flat profile survives (sample IPs are still correct, so `hot` is still 90%); the *stacks* are gone. Same with any system binary: `prof --folded, python3 ...` gives 332 depth-1 frames. This is the honest ceiling of the approach and the reason **DWARF `.eh_frame` CFI unwinding is item 1 of Milestone 1** in `PLAN.md` instead of something handwaved as done.
+  The flat profile survives (sample IPs are still correct, so `hot` is still 90%); the *stacks* are gone. Same with any system binary: `prof --folded, python3 ...` gives 332 depth-1 frames. This is the honest ceiling of the approach and the reason DWARF `.eh_frame` CFI unwinding is item 1 of Milestone 1 in `PLAN.md` instead of something handwaved as done.
 - Even `-fno-omit-frame-pointer` is not enough for leaf functions. GCC 14 on x86-64 omits the prologue entirely for a leaf that needs no stack slot, and `-mno-omit-leaf-frame-pointer` does not change that. Sampling inside such a leaf yields the *caller's* RBP, so one level of the chain vanishes, we measured exactly `main;level1;hot`, with `level2` silently missing. `t/workload.c`'s `BURN` macro keeps one `volatile` local specifically to force the frame back; the comment there says so. Nothing in `prof` can fix this, only CFI can.
 - No kernel stacks. `exclude_kernel=1` is mandatory at `paranoid >= 2` and we could not unwind kernel frames anyway. Time spent in syscalls is attributed to the user-space frame that called in.
 - No JIT support. Symbols come from ELF files on disk. JVM/V8/LuaJIT code shows as `module+offset` or a bare address; `/tmp/perf-PID.map` is not read.
