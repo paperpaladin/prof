@@ -99,24 +99,22 @@ Pipe the folded form straight into a flamegraph:
 ./prof --folded -o out.folded -- ./prog && flamegraph.pl out.folded > out.svg
 ```
 
-## Status
-
-### Which sampling mechanism this actually uses
+## Which sampling mechanism this actually uses
 
 `perf_event_open(2)` directly, for real, **no fallback was needed on this kernel.** Measured here:
 
 - `/proc/sys/kernel/perf_event_paranoid` = **2**
 - kernel 7.2.8-200.fc44.x86_64, unprivileged uid 1000, no root, no sysctl changed
-- `/proc/sys/kernel/perf_event_max_sample_rate` = 6000 here (so `-F` above that is rejected by the kernel; `prof` says so). The kernel auto-throttles this sysctl, so it moves on its own, it read 14000 when this was written and `prof` quotes the live value rather than this one.
+- `/proc/sys/kernel/perf_event_max_sample_rate` = 6000 here (so `-F` above that is rejected by the kernel; `prof` says so). The kernel auto-throttles this sysctl, so it moves on its own, it read 14000 when this was written and `prof` quotes the live value, not this one.
 
 `paranoid=2` forbids kernel-mode measurement but permits a user to sample their own processes, which is all this needs: every event is opened with `exclude_kernel=1` and `exclude_hv=1`. The event tried first is `PERF_TYPE_HARDWARE`/`PERF_COUNT_HW_CPU_CYCLES`, which is what worked here (`hw cpu-cycles` in the summary line). If no PMU is exposed: a VM or container without PMU pass-through, it falls back to `PERF_TYPE_SOFTWARE`/`PERF_COUNT_SW_CPU_CLOCK` and then `SW_TASK_CLOCK`, both hrtimer-driven. The summary line always names which one it got, so you never have to guess. The `setitimer`/`SIGPROF`-via-`LD_PRELOAD` and `/proc/PID/stat`-polling fallbacks described as contingencies were **not** implemented, because they were not needed and writing unused code would be worse than not writing it.
 
 Two kernel details that shaped the design, both discovered by hitting them:
 
-- The event is opened **per CPU** with `inherit=1` and `pid=child`, not as a single per-task event. `perf_mmap()` refuses a per-task event with `inherit=1` (`EINVAL`) because all inherited children would share one ring buffer. Per-CPU events are how `perf record` follows threads. That was stated here as "verified: a two-thread target yields both `main;spin` and `th;spin`", there is no such target in this repo and `git log --all` shows there never was, so the claim is removed rather than restated. t/workload.c is single-threaded.
-- The executable mappings are re-read from `/proc/PID/maps` on every drain iteration rather than snapshotted once. A single early snapshot races `ld.so`: you see the main binary but not yet libc, every return address into libc then looks unmapped, and stacks truncate **non-deterministically**. It also has to happen while the target is alive, since `/proc/PID/maps` disappears the instant it exits.
+- The event is opened **per CPU** with `inherit=1` and `pid=child`, not as a single per-task event. `perf_mmap()` refuses a per-task event with `inherit=1` (`EINVAL`) because all inherited children would share one ring buffer. Per-CPU events are how `perf record` follows threads. That was stated here as "verified: a two-thread target yields both `main;spin` and `th;spin`", there is no such target in this repo and `git log --all` shows there never was, so the claim is removed, not restated. t/workload.c is single-threaded.
+- The executable mappings are re-read from `/proc/PID/maps` on every drain iteration, not snapshotted once. A single early snapshot races `ld.so`: you see the main binary but not yet libc, every return address into libc then looks unmapped, and stacks truncate **non-deterministically**. It also has to happen while the target is alive, since `/proc/PID/maps` disappears the instant it exits.
 
-### Two assertions used to pass on no output at all
+## Two assertions used to pass on no output at all
 
 Both are the suite's defences against prof producing nothing, and both were
 satisfied by prof producing nothing.
@@ -133,7 +131,7 @@ stacks.
 awk over zero records runs no rules and exits 0.
 
 Both now require the file to be non-empty first, and both report the line
-count so the number is in the output rather than implied.
+count so the number is in the output, not implied.
 
 The spelling of that guard matters too. `grep -c . file || echo 0` looks
 right and is wrong: `grep -c` prints `0` **and** exits 1 when nothing
@@ -152,13 +150,13 @@ does not have that problem.
   cold 6
   ```
 
-  The flat profile survives (sample IPs are still correct, so `hot` is still 90%); the *stacks* are gone. Same with any system binary: `prof --folded, python3 ...` gives 332 depth-1 frames. This is the honest ceiling of the approach and the reason **DWARF `.eh_frame` CFI unwinding is item 1 of Milestone 1** in `PLAN.md`, not something handwaved as done.
+  The flat profile survives (sample IPs are still correct, so `hot` is still 90%); the *stacks* are gone. Same with any system binary: `prof --folded, python3 ...` gives 332 depth-1 frames. This is the honest ceiling of the approach and the reason **DWARF `.eh_frame` CFI unwinding is item 1 of Milestone 1** in `PLAN.md` instead of something handwaved as done.
 - Even `-fno-omit-frame-pointer` is not enough for leaf functions. GCC 14 on x86-64 omits the prologue entirely for a leaf that needs no stack slot, and `-mno-omit-leaf-frame-pointer` does not change that. Sampling inside such a leaf yields the *caller's* RBP, so one level of the chain vanishes, we measured exactly `main;level1;hot`, with `level2` silently missing. `t/workload.c`'s `BURN` macro keeps one `volatile` local specifically to force the frame back; the comment there says so. Nothing in `prof` can fix this, only CFI can.
 - No kernel stacks. `exclude_kernel=1` is mandatory at `paranoid >= 2` and we could not unwind kernel frames anyway. Time spent in syscalls is attributed to the user-space frame that called in.
 - No JIT support. Symbols come from ELF files on disk. JVM/V8/LuaJIT code shows as `module+offset` or a bare address; `/tmp/perf-PID.map` is not read.
-- No off-CPU profiling. A process blocked on I/O generates no cycles and no samples; `prof` says "no samples" rather than telling you where it was blocked.
+- No off-CPU profiling. A process blocked on I/O generates no cycles and no samples; `prof` says "no samples" instead of telling you where it was blocked.
 - No inline-frame expansion. One address maps to one symbol. Inlined callees are attributed to the function they were inlined into (which is also why the workload builds with `-fno-inline`).
-- 8KB of stack is copied per sample, so stacks deeper than that are truncated. The count of truncations is reported in the summary line rather than hidden. (A figure of 92 truncations "from a two-thread test" used to sit here; that target does not exist in this repo and `n_trunc` is not asserted anywhere in the harness.)
+- 8KB of stack is copied per sample, so stacks deeper than that are truncated. The count of truncations is reported in the summary line, not hidden. (A figure of 92 truncations "from a two-thread test" used to sit here; that target does not exist in this repo and `n_trunc` is not asserted anywhere in the harness.)
 - 64-bit little-endian ELF only. No 32-bit, no separate debuginfo files, no compressed debug sections, no C++ demangling.
 - One snapshot of symbols per object; a `dlopen` is picked up (maps are refreshed continuously) but an unmap/remap at the same address is not.
 - Symbols from every sampled process share one table, so a target that `fork()`s has its children's PIE addresses resolved against the parent's mappings. `inherit=1` samples them; naming them correctly needs `PERF_RECORD_FORK`/`MMAP2`.
@@ -187,7 +185,7 @@ Three things that are the way they are for a reason, each with the reason in the
 - Records are `memcpy`'d out of the ring, never read in place. A record straddles the end of the circular buffer whenever it feels like it; `ring_copy()` unwraps it.
 - The load bias is computed per `PT_LOAD` segment, not by assuming `p_vaddr == p_offset`. Under `-z separate-code` a PIE has four `PT_LOAD`s, and guessing gets every symbol in a shared library wrong by a page or two, which looks like a working profiler that names the wrong function.
 
-There is no signal handler and nothing runs in the target's address space, so the usual "do not allocate in the signal path" hazard does not apply to this design. It would apply immediately to the `setitimer`/`SIGPROF` fallback: a `SIGPROF` handler that called `malloc` or `fprintf` would deadlock the moment a sample landed inside the allocator, which is why such a sampler must write fixed-size records into a preallocated lock-free buffer and symbolise later. That is noted as a non-goal rather than half-built.
+There is no signal handler and nothing runs in the target's address space, so the usual "do not allocate in the signal path" hazard does not apply to this design. It would apply immediately to the `setitimer`/`SIGPROF` fallback: a `SIGPROF` handler that called `malloc` or `fprintf` would deadlock the moment a sample landed inside the allocator, which is why such a sampler must write fixed-size records into a preallocated lock-free buffer and symbolise later. That is noted as a non-goal, not half-built.
 
 Deliberate shortcuts are marked `shortcut:` in the source, each naming its ceiling and upgrade path.
 

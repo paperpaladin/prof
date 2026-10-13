@@ -97,7 +97,7 @@ is unavailable or fewer than 50 samples were collected, because a green
 
 Each of these builds, and each passes the tests that exist at it. Two pairs are
 deliberately red-then-green, because the oracle caught something and the symptom
-is worth having in history rather than described from memory.
+is worth having in history, not described from memory.
 
 - [x] `skeleton`, fork/exec a target, pass its exit status back, park the child
       on a pipe between fork and exec.
@@ -189,7 +189,7 @@ is worth having in history rather than described from memory.
       still be alive, and gets `dlopen`/`munmap` exactly right instead of
       approximately right.
 - [ ] Per-PID address spaces so a target that `fork()`s is attributed per
-      process rather than against one merged symbol table.
+      process, not against one merged symbol table.
       why: `inherit=1` already samples children; their addresses are currently
       resolved against the parent's maps, which is wrong for any PIE child.
 - [ ] Inline-frame expansion from `.debug_line`/`.debug_info`.
