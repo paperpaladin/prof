@@ -29,12 +29,12 @@ second, and writes a profile of where it spent CPU time.
 
 Two of them, and every commit is checked against both:
 
-1. **Profiling does not change the profiled program.** Its stdout is
+1. Profiling does not change the profiled program. Its stdout is
    byte-identical and its exit status is passed through unchanged. Nothing is
    injected into its address space, no signal handler is installed in it, no
    environment variable is set for it, and its stdin/stdout/stderr are its own.
    Measured overhead at 997 Hz is inside run-to-run noise.
-2. **A deliberately planted hot loop is always found, and named.** If `hot()`
+2. A deliberately planted hot loop is always found, and named. If `hot()`
    is built to burn 100 units against `warm()`'s 10 and `cold()`'s 1, then
    `hot` is the top symbol of the flat profile with >60% of samples and >3x
    `warm`. A profiler that cannot find a planted hot loop, or that finds it but
@@ -45,27 +45,27 @@ Two of them, and every commit is checked against both:
 Ranked by how much a failure would matter. All of it is ground truth we
 construct, none of it is a comparison against another profiler.
 
-1. **Transparency**: target stdout byte-identical, exit status `7` preserved,
+1. Transparency: target stdout byte-identical, exit status `7` preserved,
    `-o FILE` keeps the profile out of stdout. A profiler you cannot trust not
    to perturb the program is useless even when its numbers are right.
-2. **The planted ratios**: `hot` >60% of samples (built as ~90%), `hot` >3x
+2. The planted ratios: `hot` >60% of samples (built as ~90%), `hot` >3x
    `warm` (built as 10x), `warm` > `cold`. The whole point.
-3. **Symbol naming**: the hottest symbol is literally `hot`. Catches a wrong
+3. Symbol naming: the hottest symbol is literally `hot`. Catches a wrong
    load bias, a missed `.symtab`, an off-by-one in the address binary search:
    all failures that still produce beautiful output.
-4. **Stack plausibility**: `main;level1;level2;hot` appears verbatim in the
+4. Stack plausibility: `main;level1;level2;hot` appears verbatim in the
    folded output, and every folded line is exactly two fields so flamegraph
    tools accept it. Catches a unwinder that drops or invents a frame.
-5. **The address space is known completely**: symbols still resolve when the
+5. The address space is known completely: symbols still resolve when the
    target execs a second image, and every stack reaches past `main` into the C
    runtime entry frame. Catches an incomplete `/proc/PID/maps` snapshot, whose
    failure mode is *non-deterministic* truncation and therefore worse than
    consistent truncation.
-6. **The sampler actually samples periodically**: 4x the frequency gives ~4x
+6. The sampler actually samples periodically: 4x the frequency gives ~4x
    the samples, 2x the run time gives ~2x the samples. The only check that can
    catch a sampler firing once per run and extrapolating, which every other
    assertion above would happily pass.
-7. **No silent loss**: `PERF_RECORD_LOST` reports zero at 1997 Hz, proving the
+7. No silent loss: `PERF_RECORD_LOST` reports zero at 1997 Hz, proving the
    non-blocking drain loop keeps up with the kernel.
 
 Harness prints `N passed, M failed, K skipped` and exits nonzero on any

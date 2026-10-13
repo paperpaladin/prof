@@ -28,15 +28,15 @@ Three separate copies of the same loop, with a 10x and 100x iteration count. Not
 
 `t/run.sh` then asserts 15 things, in roughly descending order of how badly a failure would matter:
 
-1. **Transparency.** The target's stdout is byte-identical and its exit status (a distinctive `7`) passes through unchanged, with or without the profiler. A profiler that perturbs its target is worse than no profiler.
-2. **The planted hot loop is found.** `hot()` takes >60% of samples (built to be ~90%) and >3x the samples of `warm()` (built as 10x), and `warm()` outweighs `cold()`.
-3. **The hottest symbol is named `hot`.** Symbolisation is where profilers fail quietly; a profile full of `0x7f...` addresses is a profile nobody reads.
-4. **The chain `main;level1;level2;hot` appears in the folded output**, and every folded line is exactly `stack count` so flamegraph tooling can eat it.
-5. **The address space is known completely.** Symbols must still resolve when the target execs a second image (`sh -c "exec t/workload 1"`, the shape of every wrapper script), and every stack must reach past `main` into the C runtime entry frame. Both catch an incomplete `/proc/PID/maps` snapshot, which truncates stacks *non-deterministically*, strictly worse than truncating them always, because the two profiles are indistinguishable.
-6. **The sampler really samples.** 4x the frequency gives ~4x the samples; 2x the run time gives ~2x the samples. This is the test that catches a "profiler" that fires once and extrapolates: the single most embarrassing possible bug here, and invisible to every other check.
+1. Transparency. The target's stdout is byte-identical and its exit status (a distinctive `7`) passes through unchanged, with or without the profiler. A profiler that perturbs its target is worse than no profiler.
+2. The planted hot loop is found. `hot()` takes >60% of samples (built to be ~90%) and >3x the samples of `warm()` (built as 10x), and `warm()` outweighs `cold()`.
+3. The hottest symbol is named `hot`. Symbolisation is where profilers fail quietly; a profile full of `0x7f...` addresses is a profile nobody reads.
+4. The chain `main;level1;level2;hot` appears in the folded output, and every folded line is exactly `stack count` so flamegraph tooling can eat it.
+5. The address space is known completely. Symbols must still resolve when the target execs a second image (`sh -c "exec t/workload 1"`, the shape of every wrapper script), and every stack must reach past `main` into the C runtime entry frame. Both catch an incomplete `/proc/PID/maps` snapshot, which truncates stacks *non-deterministically*, strictly worse than truncating them always, because the two profiles are indistinguishable.
+6. The sampler really samples. 4x the frequency gives ~4x the samples; 2x the run time gives ~2x the samples. This is the test that catches a "profiler" that fires once and extrapolates: the single most embarrassing possible bug here, and invisible to every other check.
 
    Asserted at **3.0x and 1.75x**, not at 4x and 2x, because this is a sampling profiler and the ratio is a claim about this CPU under this load. Measured here across several runs: 3.9x-4.4x and 1.9x-2.1x: a sampling ratio, so it is a range and not a figure. The bars were **1.6x and 1.5x** until an audit pointed out that a sampler realising 40% of the requested frequency increase would pass, while the pass message prints the measured ratio, so the output read as though the stated claim were being enforced. Stating both numbers because the gap between what is claimed and what is asserted is the reader's business.
-7. **Nothing was dropped.** `PERF_RECORD_LOST` must report zero at 1997 Hz, i.e. the drain loop keeps up.
+7. Nothing was dropped. `PERF_RECORD_LOST` must report zero at 1997 Hz, i.e. the drain loop keeps up.
 
 Measured on this machine, one run: `hot` 90.3% of samples, `hot/warm` 10.2x, `warm` 63 vs `cold` 6 samples, frequency scaling 4.05x for 4x Hz, duration scaling 1.96x for 2x reps. All five move run to run; the assertions are the bars above, not these.
 
@@ -144,7 +144,7 @@ does not have that problem.
 
 ## What does not work
 
-- **Frame pointers are required.** Stack unwinding walks the saved-RBP chain, so it only works on code built with `-fno-omit-frame-pointer`. On an optimised binary the stacks collapse to depth 1. Live demonstration: the same workload at `-O2 -fomit-frame-pointer`:
+- Frame pointers are required. Stack unwinding walks the saved-RBP chain, so it only works on code built with `-fno-omit-frame-pointer`. On an optimised binary the stacks collapse to depth 1. Live demonstration: the same workload at `-O2 -fomit-frame-pointer`:
 
   ```
   hot 671
@@ -153,11 +153,11 @@ does not have that problem.
   ```
 
   The flat profile survives (sample IPs are still correct, so `hot` is still 90%); the *stacks* are gone. Same with any system binary: `prof --folded, python3 ...` gives 332 depth-1 frames. This is the honest ceiling of the approach and the reason **DWARF `.eh_frame` CFI unwinding is item 1 of Milestone 1** in `PLAN.md`, not something handwaved as done.
-- **Even `-fno-omit-frame-pointer` is not enough for leaf functions.** GCC 14 on x86-64 omits the prologue entirely for a leaf that needs no stack slot, and `-mno-omit-leaf-frame-pointer` does not change that. Sampling inside such a leaf yields the *caller's* RBP, so one level of the chain vanishes, we measured exactly `main;level1;hot`, with `level2` silently missing. `t/workload.c`'s `BURN` macro keeps one `volatile` local specifically to force the frame back; the comment there says so. Nothing in `prof` can fix this, only CFI can.
-- **No kernel stacks.** `exclude_kernel=1` is mandatory at `paranoid >= 2` and we could not unwind kernel frames anyway. Time spent in syscalls is attributed to the user-space frame that called in.
-- **No JIT support.** Symbols come from ELF files on disk. JVM/V8/LuaJIT code shows as `module+offset` or a bare address; `/tmp/perf-PID.map` is not read.
-- **No off-CPU profiling.** A process blocked on I/O generates no cycles and no samples; `prof` says "no samples" rather than telling you where it was blocked.
-- **No inline-frame expansion.** One address maps to one symbol. Inlined callees are attributed to the function they were inlined into (which is also why the workload builds with `-fno-inline`).
+- Even `-fno-omit-frame-pointer` is not enough for leaf functions. GCC 14 on x86-64 omits the prologue entirely for a leaf that needs no stack slot, and `-mno-omit-leaf-frame-pointer` does not change that. Sampling inside such a leaf yields the *caller's* RBP, so one level of the chain vanishes, we measured exactly `main;level1;hot`, with `level2` silently missing. `t/workload.c`'s `BURN` macro keeps one `volatile` local specifically to force the frame back; the comment there says so. Nothing in `prof` can fix this, only CFI can.
+- No kernel stacks. `exclude_kernel=1` is mandatory at `paranoid >= 2` and we could not unwind kernel frames anyway. Time spent in syscalls is attributed to the user-space frame that called in.
+- No JIT support. Symbols come from ELF files on disk. JVM/V8/LuaJIT code shows as `module+offset` or a bare address; `/tmp/perf-PID.map` is not read.
+- No off-CPU profiling. A process blocked on I/O generates no cycles and no samples; `prof` says "no samples" rather than telling you where it was blocked.
+- No inline-frame expansion. One address maps to one symbol. Inlined callees are attributed to the function they were inlined into (which is also why the workload builds with `-fno-inline`).
 - 8KB of stack is copied per sample, so stacks deeper than that are truncated. The count of truncations is reported in the summary line rather than hidden. (A figure of 92 truncations "from a two-thread test" used to sit here; that target does not exist in this repo and `n_trunc` is not asserted anywhere in the harness.)
 - 64-bit little-endian ELF only. No 32-bit, no separate debuginfo files, no compressed debug sections, no C++ demangling.
 - One snapshot of symbols per object; a `dlopen` is picked up (maps are refreshed continuously) but an unmap/remap at the same address is not.
@@ -183,9 +183,9 @@ exit                        with the child's status
 
 Three things that are the way they are for a reason, each with the reason in the source:
 
-- **The drain loop never blocks on the child.** `poll` with a 20 ms timeout plus `waitpid(WNOHANG)`, never a blocking `wait`. While nobody drains, the kernel keeps writing; once `data_head` laps `data_tail` samples are dropped and reported as `PERF_RECORD_LOST`. The "0 lost at 1997 Hz" assertion in the test suite exists to keep this honest.
-- **Records are `memcpy`'d out of the ring, never read in place.** A record straddles the end of the circular buffer whenever it feels like it; `ring_copy()` unwraps it.
-- **The load bias is computed per `PT_LOAD` segment**, not by assuming `p_vaddr == p_offset`. Under `-z separate-code` a PIE has four `PT_LOAD`s, and guessing gets every symbol in a shared library wrong by a page or two, which looks like a working profiler that names the wrong function.
+- The drain loop never blocks on the child. `poll` with a 20 ms timeout plus `waitpid(WNOHANG)`, never a blocking `wait`. While nobody drains, the kernel keeps writing; once `data_head` laps `data_tail` samples are dropped and reported as `PERF_RECORD_LOST`. The "0 lost at 1997 Hz" assertion in the test suite exists to keep this honest.
+- Records are `memcpy`'d out of the ring, never read in place. A record straddles the end of the circular buffer whenever it feels like it; `ring_copy()` unwraps it.
+- The load bias is computed per `PT_LOAD` segment, not by assuming `p_vaddr == p_offset`. Under `-z separate-code` a PIE has four `PT_LOAD`s, and guessing gets every symbol in a shared library wrong by a page or two, which looks like a working profiler that names the wrong function.
 
 There is no signal handler and nothing runs in the target's address space, so the usual "do not allocate in the signal path" hazard does not apply to this design. It would apply immediately to the `setitimer`/`SIGPROF` fallback: a `SIGPROF` handler that called `malloc` or `fprintf` would deadlock the moment a sample landed inside the allocator, which is why such a sampler must write fixed-size records into a preallocated lock-free buffer and symbolise later. That is noted as a non-goal rather than half-built.
 
