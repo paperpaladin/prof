@@ -2,7 +2,7 @@
 
 ## Contract
 
-`prof [-F HZ] [-o FILE] [--folded] -- ./prog args...` runs `./prog args...` to
+`prof [-F HZ] [-o FILE] [--folded], ./prog args...` runs `./prog args...` to
 completion, samples its user-space instruction pointer and stack at `HZ` per
 second, and writes a profile of where it spent CPU time.
 
@@ -45,27 +45,27 @@ Two of them, and every commit is checked against both:
 Ranked by how much a failure would matter. All of it is ground truth we
 construct, none of it is a comparison against another profiler.
 
-1. **Transparency** -- target stdout byte-identical, exit status `7` preserved,
+1. **Transparency**: target stdout byte-identical, exit status `7` preserved,
    `-o FILE` keeps the profile out of stdout. A profiler you cannot trust not
    to perturb the program is useless even when its numbers are right.
-2. **The planted ratios** -- `hot` >60% of samples (built as ~90%), `hot` >3x
+2. **The planted ratios**: `hot` >60% of samples (built as ~90%), `hot` >3x
    `warm` (built as 10x), `warm` > `cold`. The whole point.
-3. **Symbol naming** -- the hottest symbol is literally `hot`. Catches a wrong
+3. **Symbol naming**: the hottest symbol is literally `hot`. Catches a wrong
    load bias, a missed `.symtab`, an off-by-one in the address binary search:
    all failures that still produce beautiful output.
-4. **Stack plausibility** -- `main;level1;level2;hot` appears verbatim in the
+4. **Stack plausibility**: `main;level1;level2;hot` appears verbatim in the
    folded output, and every folded line is exactly two fields so flamegraph
    tools accept it. Catches a unwinder that drops or invents a frame.
-5. **The address space is known completely** -- symbols still resolve when the
+5. **The address space is known completely**: symbols still resolve when the
    target execs a second image, and every stack reaches past `main` into the C
    runtime entry frame. Catches an incomplete `/proc/PID/maps` snapshot, whose
    failure mode is *non-deterministic* truncation and therefore worse than
    consistent truncation.
-6. **The sampler actually samples periodically** -- 4x the frequency gives ~4x
+6. **The sampler actually samples periodically**: 4x the frequency gives ~4x
    the samples, 2x the run time gives ~2x the samples. The only check that can
    catch a sampler firing once per run and extrapolating, which every other
    assertion above would happily pass.
-7. **No silent loss** -- `PERF_RECORD_LOST` reports zero at 1997 Hz, proving the
+7. **No silent loss**: `PERF_RECORD_LOST` reports zero at 1997 Hz, proving the
    non-blocking drain loop keeps up with the kernel.
 
 Harness prints `N passed, M failed, K skipped` and exits nonzero on any
@@ -99,85 +99,85 @@ Each of these builds, and each passes the tests that exist at it. Two pairs are
 deliberately red-then-green, because the oracle caught something and the symptom
 is worth having in history rather than described from memory.
 
-- [x] `skeleton` -- fork/exec a target, pass its exit status back, park the child
+- [x] `skeleton`, fork/exec a target, pass its exit status back, park the child
       on a pipe between fork and exec.
       why: not perturbing the target outranks measuring it, and the perf events
       have to be attached in exactly that gap, so process control comes first.
-- [x] `mechanism` -- probe `perf_event_paranoid`, ladder from HW cpu-cycles to
+- [x] `mechanism`, probe `perf_event_paranoid`, ladder from HW cpu-cycles to
       SW_CPU_CLOCK to SW_TASK_CLOCK, report which one opened.
       why: the project is infeasible if an unprivileged user cannot sample, and
       the answer (paranoid=2, hardware cycles available) had to come from a
       running program. Naming the event that actually opened is what stops the
       output claiming a mechanism it did not get.
-- [x] `ring buffer` -- per-CPU events, mmap'd buffers, non-blocking drain,
+- [x] `ring buffer`, per-CPU events, mmap'd buffers, non-blocking drain,
       `PERF_RECORD_LOST` accounting.
       why: `perf_mmap()` returns EINVAL for a per-task event with `inherit=1`, so
       following threads forces per-CPU events. And a drain that blocks on the
       child silently loses most of its samples while still printing a profile.
-- [x] `samples` -- decode the `PERF_RECORD_SAMPLE` layout, aggregate into a
+- [x] `samples`, decode the `PERF_RECORD_SAMPLE` layout, aggregate into a
       string-keyed table, emit a flat profile of raw addresses.
       why: the record body is untagged fields in a fixed documented order, so the
       parser and its field order comment are the thing to get right once.
-- [x] `maps` -- parse `/proc/PID/maps`, attribute addresses as `module+offset`.
+- [x] `maps`, parse `/proc/PID/maps`, attribute addresses as `module+offset`.
       why: half of naming an address is knowing which file is mapped there, and
       `module+offset` survives ASLR where a raw address does not.
-- [x] `elf` -- hand-rolled `.symtab`/`.dynsym` reader, per-`PT_LOAD` load bias,
+- [x] `elf`, hand-rolled `.symtab`/`.dynsym` reader, per-`PT_LOAD` load bias,
       address-to-symbol binary search.
       why: a load bias computed as `start - pgoff` is wrong for most segments
       under `-z separate-code`, and the failure mode is naming the function a
-      page away -- invisible in the output.
-- [x] `unwind` -- `REGS_USER` + `STACK_USER` capture and a saved-RBP walk.
+      page away, invisible in the output.
+- [x] `unwind`: `REGS_USER` + `STACK_USER` capture and a saved-RBP walk.
       why: a flat profile says which function is hot; only a stack says why.
-- [x] `output` -- collapsed/folded stacks for flamegraph tools.
+- [x] `output`, collapsed/folded stacks for flamegraph tools.
       why: the format every existing flamegraph renderer consumes, which is the
       whole reason not to write a renderer here.
-- [x] `oracle` -- `t/workload.c` with 100:10:1 planted ratios and a fixed chain.
+- [x] `oracle`: `t/workload.c` with 100:10:1 planted ratios and a fixed chain.
       why: up to this point "it works" meant the output looked plausible, which
       is a standard a wrong profiler meets easily.
-- [x] `harness: transparency` -- stdout byte-identical, exit status preserved,
+- [x] `harness: transparency`, stdout byte-identical, exit status preserved,
       `-o` keeps the profile out of stdout.
       why: ranked first because it is the one group that is still meaningful on a
       kernel where sampling is unavailable.
-- [x] `harness: ratios and naming` -- hot >60% and >3x warm; top symbol is `hot`.
+- [x] `harness: ratios and naming`, hot >60% and >3x warm; top symbol is `hot`.
       why: the planted ratios are the point, and symbolisation is the failure
       that hides best.
-- [x] `harness: the exact call chain` -- RED. `main;level1;level2;hot` asserted,
+- [x] `harness: the exact call chain`: RED. `main;level1;level2;hot` asserted,
       and `level2` is missing.
       why: the first thing the oracle caught. Committed red so the symptom is in
       history and bisect can land on it.
-- [x] `fix: leaf frames` -- GREEN. GCC 14 elides the prologue entirely for a leaf
+- [x] `fix: leaf frames`: GREEN. GCC 14 elides the prologue entirely for a leaf
       needing no stack slot, even under `-fno-omit-frame-pointer`; `BURN` keeps a
       `volatile` local to force it back.
       why: a frame never pushed cannot be walked, so this is a limitation of FP
       unwinding that only CFI removes, and it belongs in the README not in a
       workaround nobody can explain.
-- [x] `harness: the maps snapshot is complete` -- RED. Nothing resolves at all
+- [x] `harness: the maps snapshot is complete`: RED. Nothing resolves at all
       when the target execs a second image; and intermittently, stacks stop at
       `main`.
       why: the second thing the oracle caught, and the deterministic exec form is
       what pinned down an intermittent libc-truncation symptom.
-- [x] `fix: refresh maps every drain` -- GREEN. A single snapshot races `ld.so`
+- [x] `fix: refresh maps every drain`: GREEN. A single snapshot races `ld.so`
       and can never see a later exec or `dlopen`.
       why: re-reading `/proc/PID/maps` costs a 4 KB read; parsing an ELF symbol
       table still happens once per object.
-- [x] `harness: scaling and loss` -- 4x Hz gives ~4x samples, 2x run time gives
+- [x] `harness: scaling and loss`, 4x Hz gives ~4x samples, 2x run time gives
       ~2x samples, zero lost at 1997 Hz.
       why: the only assertions that can catch a sampler which fires once and
-      extrapolates -- every other check in the suite would pass one.
-- [x] `README` -- real transcript, and a limitations list longer than the design
+      extrapolates, every other check in the suite would pass one.
+- [x] `README`, real transcript, and a limitations list longer than the design
       section.
       why: a profiler's limitations decide whether its output can be trusted.
-- [x] `PLAN` -- this file.
+- [x] `PLAN`, this file.
       why: so later work is judged against something written down.
 
-### Milestone 1 -- make it work on real optimised binaries
+### Milestone 1: make it work on real optimised binaries
 
 - [ ] DWARF `.eh_frame` CFI unwinding: parse `.eh_frame_hdr`'s binary search
       table, decode CIE/FDE, run the CFA program for the sampled PC, recover
       the caller's PC/SP/BP from the captured stack.
       why: this is the one that matters. Every system binary and every
       `-O2` build omits frame pointers, so today `prof` produces depth-1 stacks
-      for anything it did not compile itself -- the flat profile is right and
+      for anything it did not compile itself: the flat profile is right and
       the flamegraph is useless. Nothing else on this list is worth doing first.
 - [ ] Register the unwinder choice per mapping: CFI where `.eh_frame` exists,
       frame pointers as the fallback, and report per-sample which was used.

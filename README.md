@@ -10,7 +10,7 @@ No libelf, no libunwind, no libdw, no libdwfl. `gcc prof.c -o prof` is the whole
 
 ## Why this exists
 
-`perf record` is a 200k-line program and `perf report` is another. The actual mechanism underneath is small enough to hold in your head: ask the kernel for a sampling event, mmap a ring buffer, read `{RIP, RBP, RSP, 8KB of stack}` out of it a thousand times a second, walk the saved-RBP chain, and binary-search a sorted symbol table. This is that, with nothing in the way -- so you can read it, break it, and see which part of a profiler is load-bearing.
+`perf record` is a 200k-line program and `perf report` is another. The actual mechanism underneath is small enough to hold in your head: ask the kernel for a sampling event, mmap a ring buffer, read `{RIP, RBP, RSP, 8KB of stack}` out of it a thousand times a second, walk the saved-RBP chain, and binary-search a sorted symbol table. This is that, with nothing in the way, so you can read it, break it, and see which part of a profiler is load-bearing.
 
 The second reason is that profilers are unusually easy to get silently, confidently wrong. A sampler that fires once per run still prints a plausible-looking profile. An unwinder that drops one frame still prints plausible-looking stacks. A symboliser that is off by one load bias still prints plausible-looking names. None of those failures look like failures. So this repo has an oracle.
 
@@ -24,7 +24,7 @@ The second reason is that profilers are unusually easy to get silently, confiden
 | `warm()` | 10 units | ~9.0% |
 | `cold()` | 1 unit | ~0.9% |
 
-Three separate copies of the same loop, with a 10x and 100x iteration count. Not a shared `burn()` helper -- if all three called one helper, every sample would land in the helper and the ratios would be untestable. And `hot()` is reachable only via `main -> level1 -> level2 -> hot`, so the correct stack is fixed by the source, not by measurement.
+Three separate copies of the same loop, with a 10x and 100x iteration count. Not a shared `burn()` helper, if all three called one helper, every sample would land in the helper and the ratios would be untestable. And `hot()` is reachable only via `main -> level1 -> level2 -> hot`, so the correct stack is fixed by the source, not by measurement.
 
 `t/run.sh` then asserts 15 things, in roughly descending order of how badly a failure would matter:
 
@@ -32,10 +32,10 @@ Three separate copies of the same loop, with a 10x and 100x iteration count. Not
 2. **The planted hot loop is found.** `hot()` takes >60% of samples (built to be ~90%) and >3x the samples of `warm()` (built as 10x), and `warm()` outweighs `cold()`.
 3. **The hottest symbol is named `hot`.** Symbolisation is where profilers fail quietly; a profile full of `0x7f...` addresses is a profile nobody reads.
 4. **The chain `main;level1;level2;hot` appears in the folded output**, and every folded line is exactly `stack count` so flamegraph tooling can eat it.
-5. **The address space is known completely.** Symbols must still resolve when the target execs a second image (`sh -c "exec t/workload 1"`, the shape of every wrapper script), and every stack must reach past `main` into the C runtime entry frame. Both catch an incomplete `/proc/PID/maps` snapshot, which truncates stacks *non-deterministically* -- strictly worse than truncating them always, because the two profiles are indistinguishable.
-6. **The sampler really samples.** 4x the frequency gives ~4x the samples; 2x the run time gives ~2x the samples. This is the test that catches a "profiler" that fires once and extrapolates -- the single most embarrassing possible bug here, and invisible to every other check.
+5. **The address space is known completely.** Symbols must still resolve when the target execs a second image (`sh -c "exec t/workload 1"`, the shape of every wrapper script), and every stack must reach past `main` into the C runtime entry frame. Both catch an incomplete `/proc/PID/maps` snapshot, which truncates stacks *non-deterministically*, strictly worse than truncating them always, because the two profiles are indistinguishable.
+6. **The sampler really samples.** 4x the frequency gives ~4x the samples; 2x the run time gives ~2x the samples. This is the test that catches a "profiler" that fires once and extrapolates: the single most embarrassing possible bug here, and invisible to every other check.
 
-   Asserted at **3.0x and 1.75x**, not at 4x and 2x, because this is a sampling profiler and the ratio is a claim about this CPU under this load. Measured here across several runs: 3.9x-4.4x and 1.9x-2.1x -- a sampling ratio, so it is a range and not a figure. The bars were **1.6x and 1.5x** until an audit pointed out that a sampler realising 40% of the requested frequency increase would pass -- while the pass message prints the measured ratio, so the output read as though the stated claim were being enforced. Stating both numbers because the gap between what is claimed and what is asserted is the reader's business.
+   Asserted at **3.0x and 1.75x**, not at 4x and 2x, because this is a sampling profiler and the ratio is a claim about this CPU under this load. Measured here across several runs: 3.9x-4.4x and 1.9x-2.1x: a sampling ratio, so it is a range and not a figure. The bars were **1.6x and 1.5x** until an audit pointed out that a sampler realising 40% of the requested frequency increase would pass, while the pass message prints the measured ratio, so the output read as though the stated claim were being enforced. Stating both numbers because the gap between what is claimed and what is asserted is the reader's business.
 7. **Nothing was dropped.** `PERF_RECORD_LOST` must report zero at 1997 Hz, i.e. the drain loop keeps up.
 
 Measured on this machine, one run: `hot` 90.3% of samples, `hot/warm` 10.2x, `warm` 63 vs `cold` 6 samples, frequency scaling 4.05x for 4x Hz, duration scaling 1.96x for 2x reps. All five move run to run; the assertions are the bars above, not these.
@@ -91,7 +91,7 @@ libc.so.6+0x1ca7;main;cold 7
 prof: 769 samples, 0 lost, 0 truncated stacks, hw cpu-cycles @ 997 Hz, 8/8 cpus
 ```
 
-`self` is samples whose innermost frame is this symbol; `total` is samples with this symbol anywhere in the stack. The profile goes to **stderr** unless you pass `-o FILE`, and never to stdout -- that is what makes `prof -- ./prog | consumer` safe. `libc.so.6+0x1ca7` is `__libc_start_call_main`, which a stripped distro libc does not export; `module+offset` is the honest answer there.
+`self` is samples whose innermost frame is this symbol; `total` is samples with this symbol anywhere in the stack. The profile goes to **stderr** unless you pass `-o FILE`, and never to stdout, that is what makes `prof, ./prog | consumer` safe. `libc.so.6+0x1ca7` is `__libc_start_call_main`, which a stripped distro libc does not export; `module+offset` is the honest answer there.
 
 Pipe the folded form straight into a flamegraph:
 
@@ -103,17 +103,17 @@ Pipe the folded form straight into a flamegraph:
 
 ### Which sampling mechanism this actually uses
 
-`perf_event_open(2)` directly, for real -- **no fallback was needed on this kernel.** Measured here:
+`perf_event_open(2)` directly, for real, **no fallback was needed on this kernel.** Measured here:
 
 - `/proc/sys/kernel/perf_event_paranoid` = **2**
 - kernel 7.2.8-200.fc44.x86_64, unprivileged uid 1000, no root, no sysctl changed
-- `/proc/sys/kernel/perf_event_max_sample_rate` = 6000 here (so `-F` above that is rejected by the kernel; `prof` says so). The kernel auto-throttles this sysctl, so it moves on its own -- it read 14000 when this was written and `prof` quotes the live value rather than this one.
+- `/proc/sys/kernel/perf_event_max_sample_rate` = 6000 here (so `-F` above that is rejected by the kernel; `prof` says so). The kernel auto-throttles this sysctl, so it moves on its own, it read 14000 when this was written and `prof` quotes the live value rather than this one.
 
-`paranoid=2` forbids kernel-mode measurement but permits a user to sample their own processes, which is all this needs: every event is opened with `exclude_kernel=1` and `exclude_hv=1`. The event tried first is `PERF_TYPE_HARDWARE`/`PERF_COUNT_HW_CPU_CYCLES`, which is what worked here (`hw cpu-cycles` in the summary line). If no PMU is exposed -- a VM or container without PMU pass-through -- it falls back to `PERF_TYPE_SOFTWARE`/`PERF_COUNT_SW_CPU_CLOCK` and then `SW_TASK_CLOCK`, both hrtimer-driven. The summary line always names which one it got, so you never have to guess. The `setitimer`/`SIGPROF`-via-`LD_PRELOAD` and `/proc/PID/stat`-polling fallbacks described as contingencies were **not** implemented, because they were not needed and writing unused code would be worse than not writing it.
+`paranoid=2` forbids kernel-mode measurement but permits a user to sample their own processes, which is all this needs: every event is opened with `exclude_kernel=1` and `exclude_hv=1`. The event tried first is `PERF_TYPE_HARDWARE`/`PERF_COUNT_HW_CPU_CYCLES`, which is what worked here (`hw cpu-cycles` in the summary line). If no PMU is exposed: a VM or container without PMU pass-through, it falls back to `PERF_TYPE_SOFTWARE`/`PERF_COUNT_SW_CPU_CLOCK` and then `SW_TASK_CLOCK`, both hrtimer-driven. The summary line always names which one it got, so you never have to guess. The `setitimer`/`SIGPROF`-via-`LD_PRELOAD` and `/proc/PID/stat`-polling fallbacks described as contingencies were **not** implemented, because they were not needed and writing unused code would be worse than not writing it.
 
 Two kernel details that shaped the design, both discovered by hitting them:
 
-- The event is opened **per CPU** with `inherit=1` and `pid=child`, not as a single per-task event. `perf_mmap()` refuses a per-task event with `inherit=1` (`EINVAL`) because all inherited children would share one ring buffer. Per-CPU events are how `perf record` follows threads. That was stated here as "verified: a two-thread target yields both `main;spin` and `th;spin`" -- there is no such target in this repo and `git log --all` shows there never was, so the claim is removed rather than restated. t/workload.c is single-threaded.
+- The event is opened **per CPU** with `inherit=1` and `pid=child`, not as a single per-task event. `perf_mmap()` refuses a per-task event with `inherit=1` (`EINVAL`) because all inherited children would share one ring buffer. Per-CPU events are how `perf record` follows threads. That was stated here as "verified: a two-thread target yields both `main;spin` and `th;spin`", there is no such target in this repo and `git log --all` shows there never was, so the claim is removed rather than restated. t/workload.c is single-threaded.
 - The executable mappings are re-read from `/proc/PID/maps` on every drain iteration rather than snapshotted once. A single early snapshot races `ld.so`: you see the main binary but not yet libc, every return address into libc then looks unmapped, and stacks truncate **non-deterministically**. It also has to happen while the target is alive, since `/proc/PID/maps` disappears the instant it exits.
 
 ### Two assertions used to pass on no output at all
@@ -123,8 +123,8 @@ satisfied by prof producing nothing.
 
 `maps: every stack reaches past main` compared the set of outermost frames
 and required exactly one, not `main`. On an empty folded file the set is the
-empty string, `printf '%s\n' "" | wc -l` is **1**, and `"" != main` is true
--- so all three conditions held, and the diagnostic helpfully printed `[]`.
+empty string, `printf '%s\n' "" | wc -l` is **1**, and `"" != main` is true,
+so all three conditions held, and the diagnostic helpfully printed `[]`.
 This is the check the README ranks as guarding against the worst failure
 mode here, non-deterministic stack truncation, and it was green on zero
 stacks.
@@ -144,7 +144,7 @@ does not have that problem.
 
 ## What does not work
 
-- **Frame pointers are required.** Stack unwinding walks the saved-RBP chain, so it only works on code built with `-fno-omit-frame-pointer`. On an optimised binary the stacks collapse to depth 1. Live demonstration -- the same workload at `-O2 -fomit-frame-pointer`:
+- **Frame pointers are required.** Stack unwinding walks the saved-RBP chain, so it only works on code built with `-fno-omit-frame-pointer`. On an optimised binary the stacks collapse to depth 1. Live demonstration: the same workload at `-O2 -fomit-frame-pointer`:
 
   ```
   hot 671
@@ -152,8 +152,8 @@ does not have that problem.
   cold 6
   ```
 
-  The flat profile survives (sample IPs are still correct, so `hot` is still 90%); the *stacks* are gone. Same with any system binary: `prof --folded -- python3 ...` gives 332 depth-1 frames. This is the honest ceiling of the approach and the reason **DWARF `.eh_frame` CFI unwinding is item 1 of Milestone 1** in `PLAN.md`, not something handwaved as done.
-- **Even `-fno-omit-frame-pointer` is not enough for leaf functions.** GCC 14 on x86-64 omits the prologue entirely for a leaf that needs no stack slot, and `-mno-omit-leaf-frame-pointer` does not change that. Sampling inside such a leaf yields the *caller's* RBP, so one level of the chain vanishes -- we measured exactly `main;level1;hot`, with `level2` silently missing. `t/workload.c`'s `BURN` macro keeps one `volatile` local specifically to force the frame back; the comment there says so. Nothing in `prof` can fix this, only CFI can.
+  The flat profile survives (sample IPs are still correct, so `hot` is still 90%); the *stacks* are gone. Same with any system binary: `prof --folded, python3 ...` gives 332 depth-1 frames. This is the honest ceiling of the approach and the reason **DWARF `.eh_frame` CFI unwinding is item 1 of Milestone 1** in `PLAN.md`, not something handwaved as done.
+- **Even `-fno-omit-frame-pointer` is not enough for leaf functions.** GCC 14 on x86-64 omits the prologue entirely for a leaf that needs no stack slot, and `-mno-omit-leaf-frame-pointer` does not change that. Sampling inside such a leaf yields the *caller's* RBP, so one level of the chain vanishes, we measured exactly `main;level1;hot`, with `level2` silently missing. `t/workload.c`'s `BURN` macro keeps one `volatile` local specifically to force the frame back; the comment there says so. Nothing in `prof` can fix this, only CFI can.
 - **No kernel stacks.** `exclude_kernel=1` is mandatory at `paranoid >= 2` and we could not unwind kernel frames anyway. Time spent in syscalls is attributed to the user-space frame that called in.
 - **No JIT support.** Symbols come from ELF files on disk. JVM/V8/LuaJIT code shows as `module+offset` or a bare address; `/tmp/perf-PID.map` is not read.
 - **No off-CPU profiling.** A process blocked on I/O generates no cycles and no samples; `prof` says "no samples" rather than telling you where it was blocked.
@@ -185,7 +185,7 @@ Three things that are the way they are for a reason, each with the reason in the
 
 - **The drain loop never blocks on the child.** `poll` with a 20 ms timeout plus `waitpid(WNOHANG)`, never a blocking `wait`. While nobody drains, the kernel keeps writing; once `data_head` laps `data_tail` samples are dropped and reported as `PERF_RECORD_LOST`. The "0 lost at 1997 Hz" assertion in the test suite exists to keep this honest.
 - **Records are `memcpy`'d out of the ring, never read in place.** A record straddles the end of the circular buffer whenever it feels like it; `ring_copy()` unwraps it.
-- **The load bias is computed per `PT_LOAD` segment**, not by assuming `p_vaddr == p_offset`. Under `-z separate-code` a PIE has four `PT_LOAD`s, and guessing gets every symbol in a shared library wrong by a page or two -- which looks like a working profiler that names the wrong function.
+- **The load bias is computed per `PT_LOAD` segment**, not by assuming `p_vaddr == p_offset`. Under `-z separate-code` a PIE has four `PT_LOAD`s, and guessing gets every symbol in a shared library wrong by a page or two, which looks like a working profiler that names the wrong function.
 
 There is no signal handler and nothing runs in the target's address space, so the usual "do not allocate in the signal path" hazard does not apply to this design. It would apply immediately to the `setitimer`/`SIGPROF` fallback: a `SIGPROF` handler that called `malloc` or `fprintf` would deadlock the moment a sample landed inside the allocator, which is why such a sampler must write fixed-size records into a preallocated lock-free buffer and symbolise later. That is noted as a non-goal rather than half-built.
 
