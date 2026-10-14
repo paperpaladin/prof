@@ -10,7 +10,7 @@ No libelf, no libunwind, no libdw, no libdwfl. `gcc prof.c -o prof` is the whole
 
 ## Why this exists
 
-`perf record` is a 200k-line program and `perf report` is another. The actual mechanism underneath is small enough to hold in your head: ask the kernel for a sampling event, mmap a ring buffer, read `{RIP, RBP, RSP, 8KB of stack}` out of it a thousand times a second, walk the saved-RBP chain, and binary-search a sorted symbol table. This is that, with nothing in the way, so you can read it, break it, and see which part of a profiler is load-bearing.
+`perf record` is a 200k-line program and `perf report` is another. The actual mechanism underneath is small enough to hold in your head. Ask the kernel for a sampling event, mmap a ring buffer, read `{RIP, RBP, RSP, 8KB of stack}` out of it a thousand times a second, walk the saved-RBP chain, and binary-search a sorted symbol table. This is that, with nothing in the way, so you can read it, break it, and see which part of a profiler is load-bearing.
 
 The second reason is that profilers are unusually easy to get silently, confidently wrong. A sampler that fires once per run still prints a plausible-looking profile. An unwinder that drops one frame still prints plausible-looking stacks. A symboliser that is off by one load bias still prints plausible-looking names. None of those failures look like failures. So this repo has an oracle.
 
@@ -35,7 +35,7 @@ Three separate copies of the same loop, with a 10x and 100x iteration count. Not
 5. The address space is known completely. Symbols must still resolve when the target execs a second image (`sh -c "exec t/workload 1"`, the shape of every wrapper script), and every stack must reach past `main` into the C runtime entry frame. Both catch an incomplete `/proc/PID/maps` snapshot, which truncates stacks *non-deterministically*, strictly worse than truncating them always, because the two profiles are indistinguishable.
 6. The sampler really samples. 4x the frequency gives ~4x the samples; 2x the run time gives ~2x the samples. This is the test that catches a "profiler" that fires once and extrapolates: the single most embarrassing possible bug here, and invisible to every other check.
 
-   Asserted at **3.0x and 1.75x**, not at 4x and 2x, because this is a sampling profiler and the ratio is a claim about this CPU under this load. Measured here across several runs: 3.9x-4.4x and 1.9x-2.1x: a sampling ratio, so it is a range and not a figure. The bars were **1.6x and 1.5x** until an audit pointed out that a sampler realising 40% of the requested frequency increase would pass, while the pass message prints the measured ratio, so the output read as though the stated claim were being enforced. Stating both numbers because the gap between what is claimed and what is asserted is the reader's business.
+   Asserted at **3.0x and 1.75x**, not at 4x and 2x, because this is a sampling profiler and the ratio is a claim about this CPU under this load. Measured here across several runs: 3.9x-4.4x and 1.9x-2.1x. A sampling ratio, so it is a range and not a figure. The bars were **1.6x and 1.5x** until an audit pointed out that a sampler realising 40% of the requested frequency increase would pass, while the pass message prints the measured ratio, so the output read as though the stated claim were being enforced. Stating both numbers because the gap between what is claimed and what is asserted is the reader's business.
 7. Nothing was dropped. `PERF_RECORD_LOST` must report zero at 1997 Hz, i.e. the drain loop keeps up.
 
 Measured on this machine, one run: `hot` 90.3% of samples, `hot/warm` 10.2x, `warm` 63 vs `cold` 6 samples, frequency scaling 4.05x for 4x Hz, duration scaling 1.96x for 2x reps. All five move run to run. The assertions are the bars above, not these.
@@ -107,7 +107,7 @@ Pipe the folded form straight into a flamegraph:
 - kernel 7.2.8-200.fc44.x86_64, unprivileged uid 1000, no root, no sysctl changed
 - `/proc/sys/kernel/perf_event_max_sample_rate` = 6000 here (so `-F` above that is rejected by the kernel; `prof` says so). The kernel auto-throttles this sysctl, so it moves on its own, it read 14000 when this was written and `prof` quotes the live value, not this one.
 
-`paranoid=2` forbids kernel-mode measurement but permits a user to sample their own processes, all this needs: every event is opened with `exclude_kernel=1` and `exclude_hv=1`. The event tried first is `PERF_TYPE_HARDWARE`/`PERF_COUNT_HW_CPU_CYCLES`, the one that worked here (`hw cpu-cycles` in the summary line). If no PMU is exposed: a VM or container without PMU pass-through, it falls back to `PERF_TYPE_SOFTWARE`/`PERF_COUNT_SW_CPU_CLOCK` and then `SW_TASK_CLOCK`, both hrtimer-driven. The summary line always names which one it got, so you never have to guess. The `setitimer`/`SIGPROF`-via-`LD_PRELOAD` and `/proc/PID/stat`-polling fallbacks described as contingencies were not implemented, because they were not needed and writing unused code would be worse than not writing it.
+`paranoid=2` forbids kernel-mode measurement but permits a user to sample their own processes, all this needs. Every event is opened with `exclude_kernel=1` and `exclude_hv=1`. The event tried first is `PERF_TYPE_HARDWARE`/`PERF_COUNT_HW_CPU_CYCLES`, the one that worked here (`hw cpu-cycles` in the summary line). If no PMU is exposed: a VM or container without PMU pass-through, it falls back to `PERF_TYPE_SOFTWARE`/`PERF_COUNT_SW_CPU_CLOCK` and then `SW_TASK_CLOCK`, both hrtimer-driven. The summary line always names which one it got, so you never have to guess. The `setitimer`/`SIGPROF`-via-`LD_PRELOAD` and `/proc/PID/stat`-polling fallbacks described as contingencies were not implemented, because they were not needed and writing unused code would be worse than not writing it.
 
 Two kernel details that shaped the design, both discovered by hitting them:
 
@@ -127,7 +127,7 @@ This is the check the README ranks as guarding against the worst failure
 mode here, non-deterministic stack truncation, and it was green on zero
 stacks.
 
-`unwind: folded output is well formed` ran an `awk` program over the file.
+`unwind. Folded output is well formed` ran an `awk` program over the file.
 awk over zero records runs no rules and exits 0.
 
 Both now require the file to be non-empty first, and both report the line
@@ -185,7 +185,7 @@ Three things that are the way they are for a reason, each with the reason in the
 - Records are `memcpy`'d out of the ring, never read in place. A record straddles the end of the circular buffer whenever it feels like it; `ring_copy()` unwraps it.
 - The load bias is computed per `PT_LOAD` segment, not by assuming `p_vaddr == p_offset`. Under `-z separate-code` a PIE has four `PT_LOAD`s, and guessing gets every symbol in a shared library wrong by a page or two, which looks like a working profiler that names the wrong function.
 
-There is no signal handler and nothing runs in the target's address space, so the usual "do not allocate in the signal path" hazard does not apply to this design. It would apply immediately to the `setitimer`/`SIGPROF` fallback: a `SIGPROF` handler that called `malloc` or `fprintf` would deadlock the moment a sample landed inside the allocator, so such a sampler must write fixed-size records into a preallocated lock-free buffer and symbolise later. That is noted as a non-goal, not half-built.
+There is no signal handler and nothing runs in the target's address space, so the usual "do not allocate in the signal path" hazard does not apply to this design. It would apply immediately to the `setitimer`/`SIGPROF` fallback. A `SIGPROF` handler that called `malloc` or `fprintf` would deadlock the moment a sample landed inside the allocator, so such a sampler must write fixed-size records into a preallocated lock-free buffer and symbolise later. That is noted as a non-goal, not half-built.
 
 Deliberate shortcuts are marked `shortcut:` in the source, each naming its ceiling and upgrade path.
 
