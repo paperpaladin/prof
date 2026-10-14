@@ -129,7 +129,7 @@ is worth having in history, not described from memory.
 - [x] `unwind`: `REGS_USER` + `STACK_USER` capture and a saved-RBP walk.
       why: a flat profile says which function is hot; only a stack says why.
 - [x] `output`, collapsed/folded stacks for flamegraph tools.
-      why: the format every existing flamegraph renderer consumes, which is the
+      why: the format every existing flamegraph renderer consumes, the
       whole reason not to write a renderer here.
 - [x] `oracle`: `t/workload.c` with 100:10:1 planted ratios and a fixed chain.
       why: up to this point "it works" meant the output looked plausible, which
