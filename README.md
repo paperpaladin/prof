@@ -107,7 +107,7 @@ Pipe the folded form straight into a flamegraph:
 - kernel 7.2.8-200.fc44.x86_64, unprivileged uid 1000, no root, no sysctl changed
 - `/proc/sys/kernel/perf_event_max_sample_rate` = 6000 here (so `-F` above that is rejected by the kernel; `prof` says so). The kernel auto-throttles this sysctl, so it moves on its own, it read 14000 when this was written and `prof` quotes the live value, not this one.
 
-`paranoid=2` forbids kernel-mode measurement but permits a user to sample their own processes, which is all this needs: every event is opened with `exclude_kernel=1` and `exclude_hv=1`. The event tried first is `PERF_TYPE_HARDWARE`/`PERF_COUNT_HW_CPU_CYCLES`, which is what worked here (`hw cpu-cycles` in the summary line). If no PMU is exposed: a VM or container without PMU pass-through, it falls back to `PERF_TYPE_SOFTWARE`/`PERF_COUNT_SW_CPU_CLOCK` and then `SW_TASK_CLOCK`, both hrtimer-driven. The summary line always names which one it got, so you never have to guess. The `setitimer`/`SIGPROF`-via-`LD_PRELOAD` and `/proc/PID/stat`-polling fallbacks described as contingencies were not implemented, because they were not needed and writing unused code would be worse than not writing it.
+`paranoid=2` forbids kernel-mode measurement but permits a user to sample their own processes, all this needs: every event is opened with `exclude_kernel=1` and `exclude_hv=1`. The event tried first is `PERF_TYPE_HARDWARE`/`PERF_COUNT_HW_CPU_CYCLES`, which is what worked here (`hw cpu-cycles` in the summary line). If no PMU is exposed: a VM or container without PMU pass-through, it falls back to `PERF_TYPE_SOFTWARE`/`PERF_COUNT_SW_CPU_CLOCK` and then `SW_TASK_CLOCK`, both hrtimer-driven. The summary line always names which one it got, so you never have to guess. The `setitimer`/`SIGPROF`-via-`LD_PRELOAD` and `/proc/PID/stat`-polling fallbacks described as contingencies were not implemented, because they were not needed and writing unused code would be worse than not writing it.
 
 Two kernel details that shaped the design, both discovered by hitting them:
 
@@ -137,7 +137,7 @@ The spelling of that guard matters too. `grep -c . file || echo 0` looks
 right and is wrong: `grep -c` prints `0` and exits 1 when nothing
 matches, so the `||` appends a second zero, the variable becomes `0\n0`, and
 `[ -gt ]` becomes an integer-expression error. It fails in the right
-direction by accident, which is not the same as working. `wc -l < file`
+direction by accident, and that is not the same as working. `wc -l < file`
 does not have that problem.
 
 ## What does not work
