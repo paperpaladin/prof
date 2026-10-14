@@ -86,7 +86,7 @@ is unavailable or fewer than 50 samples were collected, because a green
 - JIT symbol maps (`/tmp/perf-PID.map`), C++ demangling, separate debuginfo
   files, compressed debug sections, 32-bit or big-endian ELF.
 - A `setitimer`/`SIGPROF` in-process sampler. It was the stated fallback if
-  `perf_event_open` had been unavailable; it is not, so building one would be
+  `perf_event_open` had been unavailable. It is not, so building one would be
   dead code. It also violates invariant 1 by construction: it runs in the
   target's address space, steals `SIGPROF`, and cannot call `malloc` or
   `fprintf` from the handler without risking a deadlock when a sample lands
@@ -138,7 +138,7 @@ is worth having in history, not described from memory.
       `-o` keeps the profile out of stdout.
       why: ranked first because it is the one group that is still meaningful on a
       kernel where sampling is unavailable.
-- [x] `harness: ratios and naming`, hot >60% and >3x warm; top symbol is `hot`.
+- [x] `harness: ratios and naming`, hot >60% and >3x warm. Top symbol is `hot`.
       why: the planted ratios are the point, and symbolisation is the failure
       that hides best.
 - [x] `harness: the exact call chain`: RED. `main;level1;level2;hot` asserted,
