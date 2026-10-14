@@ -49,7 +49,7 @@ construct, none of it is a comparison against another profiler.
    `-o FILE` keeps the profile out of stdout. A profiler you cannot trust not
    to perturb the program is useless even when its numbers are right.
 2. The planted ratios: `hot` >60% of samples (built as ~90%), `hot` >3x
-   `warm` (built as 10x), `warm` > `cold`. The whole point.
+   `warm` (built as 10x), `warm` > `cold`. Exactly the point.
 3. Symbol naming: the hottest symbol is literally `hot`. Catches a wrong
    load bias, a missed `.symtab`, an off-by-one in the address binary search:
    all failures that still produce beautiful output.
@@ -62,8 +62,7 @@ construct, none of it is a comparison against another profiler.
    failure mode is *non-deterministic* truncation and therefore worse than
    consistent truncation.
 6. The sampler actually samples periodically: 4x the frequency gives ~4x
-   the samples, 2x the run time gives ~2x the samples. The only check that can
-   catch a sampler firing once per run and extrapolating, which every other
+   the samples, 2x the run time gives ~2x the samples. Only this can catch a sampler firing once per run and extrapolating, which every other
    assertion above would happily pass.
 7. No silent loss: `PERF_RECORD_LOST` reports zero at 1997 Hz, proving the
    non-blocking drain loop keeps up with the kernel.
