@@ -351,6 +351,20 @@ else
 	else
 		ok "unwinder choice: no .eh_frame for this object, $fpf frames from the RBP walk and the chain is still right"
 	fi
+	# The outermost frame the fallback can reach is the libc entry frame,
+	# whose saved RBP is not a frame pointer: the walk has to record that
+	# return address and only then stop. Getting the order wrong loses one
+	# frame, which is a mistake that was made and caught in this repo, and
+	# nothing else notices because every other target unwinds with CFI.
+	fpouter=$(awk -F';' 'NR==1{print $1}' "$TMP/noc.fold")
+	if [ -z "$fpouter" ]; then
+		bad "unwinder choice: the fallback reaches the libc entry frame" "no folded output"
+	elif [ "$fpouter" = main ]; then
+		bad "unwinder choice: the fallback must reach past main" \
+		    "outermost frame is main, so the entry frame's return address was dropped"
+	else
+		ok "unwinder choice: the fallback reaches past main into $fpouter"
+	fi
 fi
 
 # --- 11. the sanitizer can see past the ends of the CFI buffers ------------
@@ -435,6 +449,91 @@ else
 	else
 		bad "debuginfo: no libc frame should be left as module+offset" \
 		    "$(head -1 "$TMP/dbg.fold")"
+	fi
+fi
+
+# --- 13. deep stacks ------------------------------------------------------
+# t/workload's chain is four frames, which proves an unwinder can walk a stack
+# and says nothing about a deep one. t/deep recurses as far as it is told and
+# burns CPU only at the bottom, so its depth is known by construction and
+# gdb's backtrace there is the oracle for how many frames really exist.
+#
+# Three limits only appear here: the 128-frame cap, the 8 KB of stack the
+# kernel copies per sample, and a drain loop carrying 8 KB samples instead of
+# the few hundred bytes a shallow stack produces.
+DEEP=t/deep
+if [ ! -x $DEEP ]; then
+	bad "deep: frame count matches gdb's backtrace" "$DEEP not built"
+elif ! command -v gdb >/dev/null 2>&1; then
+	skip "deep: frame count matches gdb's backtrace" "gdb not installed"
+else
+	gdeep=$(gdb -batch -ex 'set backtrace past-main on' -ex 'break burn' \
+	             -ex 'run 120 1' -ex bt $DEEP 2>/dev/null | grep -c '^#')
+	$PROF -F 1997 --folded -o "$TMP/deep.fold" -- $DEEP 120 20 >/dev/null 2>"$TMP/deep.err"
+	pdeep=$(awk -F';' '{ if (NF > m) m = NF } END { print m+0 }' "$TMP/deep.fold")
+	dn=$(samples "$TMP/deep.err")
+	: "${gdeep:=0}" "${pdeep:=0}" "${dn:=0}"
+	if [ "$gdeep" -lt 100 ]; then
+		# Without this the case passes when gdb printed nothing: 0 == 0.
+		bad "deep: frame count matches gdb's backtrace" \
+		    "gdb printed $gdeep frames for a 120-deep recursion; expected at least 100"
+	elif [ "$dn" -lt 50 ]; then
+		skip "deep: frame count matches gdb's backtrace" "only $dn samples"
+	elif [ "$pdeep" = "$gdeep" ]; then
+		ok "deep: $pdeep frames, exactly as many as gdb's backtrace finds"
+	else
+		bad "deep: frame count must match gdb's backtrace" \
+		    "gdb $gdeep frames, prof $pdeep"
+	fi
+
+	# The drain loop, carrying 8 KB samples on a 126-frame stack rather than
+	# the small ones the shallow workload produces.
+	dlost=$(sed -n 's/.*samples, \([0-9]*\) lost.*/\1/p' "$TMP/deep.err" | tail -1)
+	if [ -z "$dlost" ]; then
+		bad "deep: 0 samples lost at 1997 Hz on a 126-frame stack" \
+		    "could not find a 'N samples, M lost' line"
+	elif [ "$dlost" -eq 0 ]; then
+		ok "deep: 0 samples lost at 1997 Hz on a $pdeep-frame stack ($dn samples)"
+	else
+		bad "deep: samples were dropped at 1997 Hz on a deep stack" "$dlost lost"
+	fi
+
+	# "total" is samples with this symbol ANYWHERE in the stack, so it can
+	# never exceed the sample count -- and a recursive stack is where that
+	# breaks, because rec() appears 120 times in one stack and must be
+	# counted once. Nothing shallower can see the difference.
+	$PROF -F 1997 -o "$TMP/deep.flat" -- $DEEP 120 20 >/dev/null 2>"$TMP/deepf.err"
+	fn=$(samples "$TMP/deepf.err")
+	: "${fn:=0}"
+	over=$(awk -v n="$fn" '!/^#/ && NF >= 5 { if ($4 > n) print $NF, $4 }' "$TMP/deep.flat")
+	rows=$(grep -vc '^#' "$TMP/deep.flat")
+	if [ "$fn" -lt 50 ] || [ "$rows" -lt 3 ]; then
+		skip "deep: no symbol's total exceeds the sample count" "$fn samples, $rows rows"
+	elif [ -z "$over" ]; then
+		ok "deep: no symbol's total exceeds the $fn samples, over $rows symbols and a 120-deep recursion"
+	else
+		bad "deep: a symbol's total exceeds the sample count" \
+		    "$fn samples, but: $(printf '%s' "$over" | head -3 | tr '\n' ' ')"
+	fi
+
+	# Past the frame limit prof has to SAY it truncated. It used to stop at
+	# 128 frames and report "0 truncated stacks", which is the one number in
+	# the summary line whose whole job is to stop that being invisible.
+	$PROF -F 1997 --folded -o "$TMP/deep2.fold" -- $DEEP 300 20 >/dev/null 2>"$TMP/deep2.err"
+	cap=$(sed -n 's/.*lost, \([0-9]*\) truncated stacks (\([0-9]*\) at the \([0-9]*\)-frame limit).*/\2/p' "$TMP/deep2.err" | tail -1)
+	pdeep2=$(awk -F';' '{ if (NF > m) m = NF } END { print m+0 }' "$TMP/deep2.fold")
+	n2=$(samples "$TMP/deep2.err")
+	: "${cap:=}" "${pdeep2:=0}" "${n2:=0}"
+	if [ "$n2" -lt 20 ]; then
+		skip "deep: hitting the frame limit is reported, not silent" "only $n2 samples"
+	elif [ -z "$cap" ]; then
+		bad "deep: hitting the frame limit is reported, not silent" \
+		    "no frame-limit figure in the summary line: $(tail -2 "$TMP/deep2.err" | head -1)"
+	elif [ "$cap" -gt 0 ] && [ "$pdeep2" -gt 100 ]; then
+		ok "deep: a 300-deep target reports $cap stacks cut at the frame limit (depth $pdeep2)"
+	else
+		bad "deep: hitting the frame limit must be reported" \
+		    "$cap stacks reported truncated at depth $pdeep2, out of $n2 samples"
 	fi
 fi
 

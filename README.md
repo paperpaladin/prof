@@ -32,7 +32,7 @@ The second reason is that profilers are unusually easy to get silently, confiden
 
 Three separate copies of the same loop, with a 10x and 100x iteration count. Not a shared `burn()` helper, if all three called one helper, every sample would land in the helper and the ratios would be untestable. And `hot()` is reachable only via `main -> level1 -> level2 -> hot`, so the correct stack is fixed by the source, not by measurement.
 
-`t/run.sh` then asserts 24 things, in roughly descending order of how badly a failure would matter:
+`t/run.sh` then asserts 29 things, in roughly descending order of how badly a failure would matter:
 
 1. Transparency. The target's stdout is byte-identical and its exit status (a distinctive `7`) passes through unchanged, with or without the profiler. A profiler that perturbs its target is worse than no profiler.
 2. The planted hot loop is found. `hot()` takes >60% of samples (built to be ~90%) and >3x the samples of `warm()` (built as 10x), and `warm()` outweighs `cold()`.
@@ -91,6 +91,13 @@ the workload's own symbols, because `.` is a word boundary to grep and libc
 has a function called `__assert_fail_base.cold`. A membership test has to be
 against the set, not against the text.
 
+**`gdb`'s `backtrace` again, counted**, for stacks the four-frame workload
+cannot reach. `t/deep` recurses exactly as far as it is told and burns CPU
+only at the bottom, so its depth is fixed by its argument, and prof's deepest
+folded stack must have exactly as many frames as gdb finds: 126 at depth 120,
+and measured equal at 20, 50, 100 and 120. That is the test that found two
+real defects, both described under "what does not work".
+
 **`gas`**, for the opcodes nothing else emits. A sweep over everything above
 (500k CFI opcodes) finds only eleven distinct ones, so six opcodes this parser
 implements were unreachable from any real file and three mutations of them
@@ -129,8 +136,12 @@ ok    asan: an over-read past the .eh_frame copy is reported
 ok    asan: an over-read past the sample record is reported
 ok    debuginfo: '__libc_start_call_main' is in 5b51f4c39af9ac589408c1dc432ba390a273cc.debug and in no table of libc itself
 ok    debuginfo: no libc frame is left as module+offset
+ok    deep: 126 frames, exactly as many as gdb's backtrace finds
+ok    deep: 0 samples lost at 1997 Hz on a 126-frame stack (272 samples)
+ok    deep: no symbol's total exceeds the 276 samples, over 6 symbols and a 120-deep recursion
+ok    deep: a 300-deep target reports 272 stacks cut at the frame limit (depth 128)
 
-24 passed, 0 failed, 0 skipped
+29 passed, 0 failed, 0 skipped
 ```
 
 The `cfi:` line compares prof against readelf over this repo's own binaries and
@@ -258,7 +269,15 @@ does not have that problem.
 - No JIT support. Symbols come from ELF files on disk. JVM/V8/LuaJIT code shows as `module+offset` or a bare address; `/tmp/perf-PID.map` is not read.
 - No off-CPU profiling. A process blocked on I/O generates no cycles and no samples; `prof` says "no samples" instead of telling you where it was blocked.
 - No inline-frame expansion. One address maps to one symbol. Inlined callees are attributed to the function they were inlined into (which is also why the workload builds with `-fno-inline`).
-- 8KB of stack is copied per sample, so stacks deeper than that are truncated. The count of truncations is reported in the summary line, not hidden. (A figure of 92 truncations "from a two-thread test" used to sit here. That target does not exist in this repo and `n_trunc` is not asserted anywhere in the harness.)
+- Stacks are capped at 128 frames and at the 8 KB of stack the kernel copies per sample. Both are reported in the summary line, separately, because they have different fixes.
+
+  The frame cap was NOT reported until `t/deep` was written: a 300-frame-deep target produced 128-frame stacks and a summary line reading `0 truncated stacks`, which is the one number whose whole job is to stop that being invisible. The suite asserts it now, at depth 300, and a mutation that drops the counting is caught there and nowhere else.
+
+- At the kernel's maximum sample rate, samples are lost, and the cause is symbolisation on the critical path rather than the drain loop. Measured: 29 to 45 samples lost out of about 4400 at `-F 10000` on the 126-frame target, and 0 lost out of 272 at `-F 1997` on the same target over repeated runs.
+
+  Instrumenting the loop shows the whole of a run's loss arriving in the first two drains. The first `refresh_maps()` of a dynamically linked target takes about 9 ms, because it mmaps every object and builds a 10786-entry symbol table (libc's separate debug file alone is 4.3 MB), and nothing drains during it; a ring buffer holds about 3 ms of 8 KB samples at that rate. Two fixes were tried and measured, and both were reverted because neither worked: a one-page wakeup watermark (loss 34/33/48/35/43 before, 4/42/37/32/35 after: noise) and draining inside the wait loop (the kernel has already recorded the drop by then). No buffer within `perf_event_mlock_kb` can absorb a 9 ms stall at that rate, so the real fix is to stop symbolising on the critical path, which is the `PERF_RECORD_MMAP2` item in `PLAN.md`. It is unchecked there with these numbers against it rather than claimed.
+
+  The suite therefore asserts what is true: zero lost at 1997 Hz with 8 KB samples on a 126-frame stack, which is a real strengthening of the old shallow-stack assertion, not the max-rate zero the plan asks for.
 - 64-bit little-endian ELF only. No 32-bit, no compressed debug sections, no C++ demangling.
 - The `.gnu_debuglink` CRC32 is not checked, so a stale debug file left beside a rebuilt binary would be believed. The build-id path, which is what distros actually use, has no such hole: the filename is the identity. zlib's `crc32()` is the fix if it ever matters.
 - Nothing is read from `.debug_info`. One address maps to one symbol-table name, so an inlined callee is attributed to its caller and a function with several aliases gets whichever alias the rule above picks rather than the one the compiler called it.
@@ -347,17 +366,20 @@ The four that were not, written down rather than left for someone to discover:
 prof.c          the profiler
 Makefile        build, test, clean
 t/workload.c    the oracle: known-by-construction CPU ratios and call chain
+t/deep.c        a target whose stack DEPTH is known by construction
 t/cfi_probe.s   hand-written CFI for the opcodes no real binary emits
 t/cfi_cmp.py    diffs prof --cfi-dump against readelf, row by row
 t/run.sh        the harness
 PLAN.md         contract, invariant, oracle, non-goals, commit sequence
 ```
 
-The Makefile builds the workload four ways on purpose, because each one is a
-different unwinder. `t/workload` has frame pointers and CFI; `t/workload_nofp`
-is `-O2 -fomit-frame-pointer`, so only CFI can walk it; `t/workload_nocfi` is
-`-fno-asynchronous-unwind-tables`, so only frame pointers can; `t/cfi_probe` is
-never run at all, only parsed.
+The Makefile builds five targets on purpose, because each one exercises a
+different unwinder or limit. `t/workload` has frame pointers and CFI;
+`t/workload_nofp` is `-O2 -fomit-frame-pointer`, so only CFI can walk it;
+`t/workload_nocfi` is `-fno-asynchronous-unwind-tables`, so only frame
+pointers can; `t/deep` has a depth fixed by its argument, which is what reaches
+the frame cap, the 8 KB stack copy and a drain loop carrying 8 KB samples; and
+`t/cfi_probe` is never run at all, only parsed.
 
 ## License
 

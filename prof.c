@@ -95,6 +95,7 @@ struct ent {
 	char *key;
 	uint64_t self;  /* folded table: sample count. sym table: leaf samples. */
 	uint64_t total; /* sym table only: samples with this symbol anywhere.   */
+	uint64_t gen;   /* sym table only: the sample this entry last counted.  */
 };
 
 struct tab {
@@ -1167,20 +1168,6 @@ static int refresh_maps(pid_t pid) {
 	return nmaps;
 }
 
-/* Wait for the exec'd image itself to show up before the first drain, so the
- * earliest samples are resolvable. Bounded: a target that dies instantly just
- * yields an empty profile rather than hanging us. */
-static void await_exec(pid_t pid, const char *want) {
-	char real[PATH_MAX];
-	if (!realpath(want, real)) return;
-	for (int t = 0; t < 2000; t++) {
-		if (refresh_maps(pid) == 0) return; /* process gone */
-		for (int i = 0; i < nmaps; i++)
-			if (strcmp(maps[i].path, real) == 0) return;
-		usleep(500);
-	}
-}
-
 static int in_text(uint64_t a) {
 	for (int i = 0; i < nmaps; i++)
 		if (a >= maps[i].start && a < maps[i].end) return 1;
@@ -1257,7 +1244,7 @@ struct ring {
 static struct ring *rings;
 static int nrings;
 static uint64_t n_samples, n_lost, n_trunc;
-static uint64_t n_cfi_frames, n_fp_frames, n_fp_samples;
+static uint64_t n_cfi_frames, n_fp_frames, n_fp_samples, n_deep;
 static struct tab folded, flat;
 
 static long perf_open(struct perf_event_attr *a, pid_t pid, int cpu) {
@@ -1324,6 +1311,33 @@ static void drain(struct ring *r) {
 
 	__atomic_thread_fence(__ATOMIC_RELEASE); /* finish reading before publishing tail */
 	r->meta->data_tail = tail;
+}
+
+/* Wait for the exec'd image itself to show up before the first drain, so the
+ * earliest samples are resolvable. Bounded: a target that dies instantly just
+ * yields an empty profile rather than hanging us.
+ *
+ * This is where the samples lost at very high frequencies go. The first
+ * refresh_maps() of a dynamically linked target takes about 9 ms here,
+ * because it mmaps every object and builds a 10786-entry symbol table (libc's
+ * separate debug file alone is 4.3 MB), and nothing drains during it. At the
+ * kernel's maximum sample rate a ring holds about 3 ms of 8 KB samples, so
+ * the kernel drops some: instrumenting the loop showed a whole run's loss
+ * arriving in the first two drains, 15 samples of 4000. Draining in here as
+ * well was measured and does NOT fix it, because by then the kernel has
+ * already recorded the drop; and no buffer within perf_event_mlock_kb can
+ * absorb a 9 ms stall at that rate. The fix is to stop symbolising on the
+ * critical path, which is the deferred-symbolisation half of Milestone 1's
+ * PERF_RECORD_MMAP2 item. See README under "what does not work". */
+static void await_exec(pid_t pid, const char *want) {
+	char real[PATH_MAX];
+	if (!realpath(want, real)) return;
+	for (int t = 0; t < 2000; t++) {
+		if (refresh_maps(pid) == 0) return; /* process gone */
+		for (int i = 0; i < nmaps; i++)
+			if (strcmp(maps[i].path, real) == 0) return;
+		usleep(500);
+	}
 }
 
 /* ------------------------------------------------------------------ *
@@ -1440,7 +1454,12 @@ static void handle_sample(const unsigned char *p, size_t len) {
 	int nf = 0, fell_back = 0;
 	fr[nf++] = ip;
 	uint64_t pc = ip;
-	for (int d = 0; d < MAX_DEPTH - 1; d++) {
+	/* Every path through the body either records a frame or breaks, so this
+	 * terminates after at most MAX_DEPTH iterations. It is not written as a
+	 * counted loop because the frame limit has to be reported as a truncation
+	 * when it bites, and only a walk that had another real frame in hand and
+	 * no room for it is one: see the check on nf below. */
+	for (;;) {
 		uint64_t ra = 0;
 		int last = 0;
 		int st = cfi_step(pc, &sp, &bp, &ra, stack, sp0, dyn);
@@ -1474,6 +1493,18 @@ static void handle_sample(const unsigned char *p, size_t len) {
 		/* ra points *after* the call instruction; step back so the address
 		 * attributes to the call site and not to whatever follows it. */
 		pc = ra - 1;
+		if (nf == MAX_DEPTH) {
+			/* A real caller with nowhere to put it. This used to break out
+			 * silently, so a 400-frame target produced 128-frame stacks and a
+			 * summary line reading "0 truncated stacks" -- the one number that
+			 * was supposed to stop exactly that from being invisible. The
+			 * other truncation cause, a frame past the bytes the kernel
+			 * copied, is counted separately below, because the two have
+			 * different fixes. */
+			n_trunc++;
+			n_deep++;
+			break;
+		}
 		fr[nf++] = pc;
 		if (last) break;
 	}
@@ -1498,11 +1529,19 @@ static void handle_sample(const unsigned char *p, size_t len) {
 	tab_get(&folded, key)->self++;
 
 	tab_get(&flat, names[0])->self++;
+	/* "total" is samples with this symbol ANYWHERE in the stack, so a
+	 * recursive stack must count once, not once per frame. That used to be an
+	 * O(depth^2) scan of strcmp over the frame names, which is 8000 string
+	 * comparisons for a 126-frame stack and was the reason prof could not keep
+	 * up with the kernel's maximum sample rate on a deep target: it lost 42 of
+	 * 448 samples. A generation stamp per entry is the same answer in O(depth)
+	 * with one hash lookup per frame, and n_samples is already a unique id for
+	 * the sample being processed. */
 	for (int i = 0; i < nf; i++) {
-		int seen = 0;
-		for (int j = i + 1; j < nf; j++)
-			if (strcmp(names[i], names[j]) == 0) seen = 1;
-		if (!seen) tab_get(&flat, names[i])->total++;
+		struct ent *e = tab_get(&flat, names[i]);
+		if (e->gen == n_samples) continue;
+		e->gen = n_samples;
+		e->total++;
 	}
 }
 
@@ -1732,8 +1771,10 @@ int main(int argc, char **argv) {
 	/* Always on stderr: never on stdout, because a profiler that pollutes the
 	 * target's stdout is not transparent and cannot be dropped into a pipeline. */
 	fprintf(stderr, "%s: %" PRIu64 " samples, %" PRIu64 " lost, %" PRIu64
-	                " truncated stacks, %s @ %d Hz, %d/%d cpus\n",
-	        prog, n_samples, n_lost, n_trunc, evname, hz, nrings, ncpu);
+	                " truncated stacks (%" PRIu64 " at the %d-frame limit),"
+	                " %s @ %d Hz, %d/%d cpus\n",
+	        prog, n_samples, n_lost, n_trunc, n_deep, MAX_DEPTH, evname, hz,
+	        nrings, ncpu);
 	fprintf(stderr, "%s: unwind: %" PRIu64 " frames via .eh_frame CFI, %" PRIu64
 	                " via frame pointers (%" PRIu64 "/%" PRIu64 " samples fell back)\n",
 	        prog, n_cfi_frames, n_fp_frames, n_fp_samples, n_samples);

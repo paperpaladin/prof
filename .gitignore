@@ -3,6 +3,7 @@ t/workload
 t/workload_nofp
 t/workload_nocfi
 t/cfi_probe
+t/deep
 prof-asan
 prof-asan-plant1
 prof-asan-plant2

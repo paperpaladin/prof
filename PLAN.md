@@ -47,7 +47,7 @@ Two of them, and every commit is checked against both:
 ## Oracle
 
 Ranked by how much a failure would matter. Items 1 to 7 are ground truth we
-construct; 8 to 11 are outside authorities on DWARF and ELF, formats we do not
+construct; 8 to 12 are outside authorities on DWARF and ELF, formats we do not
 get to have an opinion about. None of it is a comparison against another
 profiler.
 
@@ -87,7 +87,10 @@ profiler.
    prof printed must be among the debug file's FUNC symbols and must not be in
    any table of the stripped library, so reading the file is the only way it
    could have been known.
-11. `gas`, for the CFI opcodes no real binary emits. `t/cfi_probe.s` writes
+11. `gdb`'s `backtrace` counted, on `t/deep`, whose depth is fixed by its
+   argument: prof's deepest stack must have exactly as many frames as gdb
+   finds. Equal at depths 20, 50, 100 and 120.
+12. `gas`, for the CFI opcodes no real binary emits. `t/cfi_probe.s` writes
    them by hand; gas encodes them and readelf says what they mean. Three
    mutations survived 73246 agreeing rows before this existed.
 
@@ -219,10 +222,13 @@ is worth having in history, not described from memory.
       `-fno-asynchronous-unwind-tables` so the suite can assert the fallback
       ran (2666 frames) and still found the planted chain.
 - [ ] Consume `PERF_RECORD_MMAP2`/`COMM`/`FORK`/`EXIT` from the ring buffer
-      instead of polling `/proc/PID/maps`.
+      instead of polling `/proc/PID/maps`, and with it defer symbolisation off
+      the drain path.
       why: removes the last race and the last reason we need the target to
       still be alive, and gets `dlopen`/`munmap` exactly right instead of
-      approximately right.
+      approximately right. The deferred half now has a measurement behind it:
+      the 9 ms symbol-table build before the first drain is where every sample
+      lost at the kernel's maximum rate goes (see the last item).
 - [ ] Per-PID address spaces so a target that `fork()`s is attributed per
       process, not against one merged symbol table.
       why: `inherit=1` already samples children; their addresses are currently
@@ -267,3 +273,18 @@ is worth having in history, not described from memory.
       at the kernel's `perf_event_max_sample_rate` on a stack-deep target.
       why: the current "0 lost at 1997 Hz" assertion only proves the loop keeps
       up with small samples on a shallow stack.
+      measured, and left unchecked because the assertion as written is FALSE:
+      at `-F 10000` (this kernel's max) on a 126-frame target, 29 to 45 of
+      about 4400 samples are lost, repeatably. Instrumenting the loop puts the
+      whole of a run's loss in the first two drains: the first
+      `refresh_maps()` takes about 9 ms building a 10786-entry symbol table,
+      nothing drains during it, and a ring holds about 3 ms of 8 KB samples at
+      that rate. A one-page wakeup watermark and draining inside the wait loop
+      were both tried and measured as no improvement (the kernel has already
+      recorded the drop), and no buffer within `perf_event_mlock_kb` can
+      absorb a 9 ms stall. The fix is deferred symbolisation, which belongs to
+      the `PERF_RECORD_MMAP2` item above. What IS now asserted: `t/deep`,
+      whose depth is fixed by construction, gives zero lost at 1997 Hz with
+      8 KB samples on a 126-frame stack, prof finds exactly as many frames as
+      gdb's backtrace does there, and the 128-frame cap is reported instead of
+      silently dropping frames.

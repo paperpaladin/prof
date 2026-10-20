@@ -25,7 +25,7 @@ NOCFIFLAGS ?= -std=c11 -O1 -g -fno-omit-frame-pointer -mno-omit-leaf-frame-point
 # slack. t/run.sh requires ASan to catch both.
 ASANFLAGS ?= -std=c11 -O1 -g -fsanitize=address -ffile-prefix-map=$(CURDIR)=.
 
-all: prof t/workload t/workload_nofp t/workload_nocfi t/cfi_probe
+all: prof t/workload t/workload_nofp t/workload_nocfi t/cfi_probe t/deep
 
 prof: prof.c
 	$(CC) $(CFLAGS) -o $@ $<
@@ -38,6 +38,13 @@ t/workload_nofp: t/workload.c
 
 t/workload_nocfi: t/workload.c
 	$(CC) $(NOCFIFLAGS) -o $@ $<
+
+# A target whose stack DEPTH is known by construction, built the way a real
+# optimised binary is so that only CFI can walk it. The shallow workload cannot
+# reach the frame limit, the 8 KB stack copy, or a drain loop carrying 8 KB
+# samples; this one reaches all three.
+t/deep: t/deep.c
+	$(CC) $(NFPFLAGS) -o $@ $<
 
 # Hand-written CFI for the opcodes no installed binary emits. gas encodes the
 # directives, readelf says what they mean, prof has to agree: see the file.
@@ -58,7 +65,7 @@ test: all prof-asan prof-asan-plant1 prof-asan-plant2
 
 clean:
 	rm -f prof prof-asan prof-asan-plant1 prof-asan-plant2 \
-	      t/workload t/workload_nofp t/workload_nocfi t/cfi_probe \
+	      t/workload t/workload_nofp t/workload_nocfi t/cfi_probe t/deep \
 	      t/*.out t/*.folded
 
 .PHONY: all test clean
