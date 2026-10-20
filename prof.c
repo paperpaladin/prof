@@ -11,13 +11,19 @@
  *
  * No libelf, no libunwind, no libdw. C11 + Linux headers only.
  *
- * shortcut: frame-pointer unwinding, not DWARF .eh_frame CFI. This is THE
- * limitation of this profiler: it only produces correct stacks for code built
- * with -fno-omit-frame-pointer. A distro libc/libstdc++ is built without frame
- * pointers, so a sample taken inside memcpy() yields a chain that stops at
- * memcpy (or worse, one bogus frame before we notice the chain is garbage).
- * The upgrade path is parsing .eh_frame CFI and running the DWARF CFA state
- * machine over the captured stack+regs, which is Milestone 1 item 1 in PLAN.md.
+ * Unwinding is DWARF .eh_frame CFI, with the saved-RBP chain as the fallback
+ * for an object whose .eh_frame we cannot index. That order matters: frame
+ * pointers are omitted by every -O2 build and by every distro libc, so an
+ * RBP-only unwinder gives depth-1 stacks for anything it did not compile
+ * itself. The summary line reports how many frames came from each, so a
+ * profile that degraded says so.
+ *
+ * shortcut: a CFA given by a DWARF expression (DW_CFA_def_cfa_expression,
+ * which gcc emits for the PLT and for a handful of libc's hand-written asm)
+ * is not evaluated, and neither are DW_CFA_expression register rules; those
+ * frames fall back to frame pointers. The upgrade path is a DWARF expression
+ * evaluator over the captured registers and stack. Signal-trampoline frames
+ * ('S' in a CIE augmentation) are also treated like ordinary ones.
  */
 
 #define _GNU_SOURCE
@@ -53,6 +59,13 @@
 #define BUF_PAGES   64       /* data pages per per-CPU ring buffer (power of 2) */
 
 static const char *prog = "prof";
+
+/* --no-cfi: refuse to use .eh_frame and unwind with frame pointers only.
+ * Not a tuning knob. It exists because "CFI recovered this call chain" is a
+ * claim about CFI, and the only way for the suite to show it is a claim about
+ * CFI rather than about the chain being easy is to turn CFI off and watch the
+ * same binary collapse to depth 1. t/run.sh asserts both halves. */
+static int no_cfi;
 
 static void die(const char *fmt, ...) {
 	va_list ap;
@@ -140,6 +153,7 @@ static struct ent *tab_get(struct tab *t, const char *key) {
 
 struct map {
 	uint64_t start, end, pgoff;
+	int obj; /* index into objs[], or -1 while unresolved */
 	char path[PATH_MAX];
 };
 
@@ -189,35 +203,726 @@ static uint64_t load_bias(const Elf64_Ehdr *eh, const void *base, const struct m
 	return m->start - m->pgoff; /* best effort */
 }
 
-/* Parse .symtab (preferred) and .dynsym out of one ELF file by hand. */
-static void load_elf_syms(const struct map *m) {
-	int fd = open(m->path, O_RDONLY);
-	if (fd < 0) return;
+/* ------------------------------------------------------------------ *
+ * DWARF .eh_frame CFI: the part that reads the file.
+ *
+ * Frame pointers are optional on x86-64 and absent from every -O2 build, so
+ * the saved-RBP walk further down is the fallback and this is the main
+ * unwinder. The compiler is obliged to emit call-frame information for
+ * exception handling even at -O2 -fomit-frame-pointer, and the linker builds
+ * .eh_frame_hdr: a version byte, three encoding bytes, a pointer to
+ * .eh_frame, a count, and then a table of (initial location, FDE pointer)
+ * pairs SORTED by address. So resolving a sampled PC to its unwind rules is a
+ * binary search, not a scan of every FDE.
+ *
+ * From the FDE we get a CIE (code/data alignment factors, the return-address
+ * register, the pointer encoding) and a program of CFI opcodes. Running that
+ * program up to the sampled PC yields one row: a rule for the canonical frame
+ * address (CFA = some register + offset) and a rule per callee-saved
+ * register. The caller's SP is the CFA by definition, and its return address
+ * and RBP are usually stored at a fixed offset from it.
+ *
+ * The oracle for all of this is readelf --debug-dump=frames-interp, which
+ * prints the same rows; prof --cfi-dump prints them in the same notation and
+ * t/cfi_cmp.py compares them row by row. Nothing here is checked against
+ * prof's own output.
+ * ------------------------------------------------------------------ */
+
+/* DWARF register numbers for x86-64 (System V psABI, figure 3.36). */
+#define DW_RBP 6
+#define DW_RSP 7
+#define DW_RA  16
+#define CFI_NREG 17 /* 0..16; only RBP, RSP and RA are ever consulted */
+
+/* DW_EH_PE_* pointer encodings (LSB Core, "Exception Frames"). */
+#define PE_OMIT     0xff
+#define PE_FMT(e)   ((e) & 0x0f)
+#define PE_APP(e)   ((e) & 0x70)
+#define PE_INDIRECT 0x80
+
+/* How a register's value in the caller's frame is recovered. The names match
+ * DWARF 5 section 6.4.1; the notation in the comments is readelf's. */
+enum {
+	RU_UNDEF = 0,   /* "u"    not recoverable */
+	RU_SAME,        /* "s"    unchanged by the callee */
+	RU_OFFSET,      /* "c-8"  at *(CFA + v) */
+	RU_VAL_OFFSET,  /* "v-8"  is CFA + v */
+	RU_REG,         /* "r6"   in register v */
+	RU_EXPR,        /* "exp"  at the address a DWARF expression computes */
+	RU_VAL_EXPR     /* "vexp" is what a DWARF expression computes */
+};
+
+struct rule {
+	unsigned char how;
+	int64_t v;
+};
+
+struct row {
+	int cfa_reg; /* -1 until a DW_CFA_def_cfa* names one */
+	int cfa_exp; /* CFA is a DWARF expression: refused, not guessed at */
+	int64_t cfa_off;
+	struct rule r[CFI_NREG];
+};
+
+struct cfi {
+	/* Exact-size copies of the two sections, NOT the mmap of the file.
+	 *
+	 * The file is mapped at st_size but a mapping is a whole number of
+	 * pages, and the bytes between the end of the file and the end of the
+	 * last page read as zero. A parser that walks one byte past the end of
+	 * .eh_frame inside that mapping therefore reads a plausible 0 and no
+	 * sanitizer says anything: the buffer is larger than its data, which is
+	 * the defect this collection has found seven times. malloc'd to the
+	 * exact byte count, ASan has a redzone to trip over, which
+	 * t/run.sh's planted-overread case requires it to do. */
+	unsigned char *hdr, *frame;
+	size_t hdrlen, framelen;
+	uint64_t hdr_va, frame_va; /* link-time addresses of those two buffers */
+	size_t tab_off;            /* search table's offset within hdr */
+	uint64_t ntab;             /* entries in it */
+	unsigned char tab_enc;
+	size_t tab_esz; /* bytes per encoded value, so 2*tab_esz per entry */
+	int ok;
+};
+
+/* A bounds-checked cursor. Every read goes through rd_ok(), and once bad is
+ * set every later read returns 0, so a truncated or hostile section produces
+ * a refusal rather than a wrong answer: callers test r.bad once at the end. */
+struct rdr {
+	const unsigned char *p, *base, *end;
+	uint64_t base_va;
+	int bad;
+};
+
+static int rd_ok(struct rdr *r, uint64_t n) {
+	if (r->bad || (uint64_t)(r->end - r->p) < n) {
+		r->bad = 1;
+		return 0;
+	}
+	return 1;
+}
+
+/* Link-time address of the byte the cursor is on: the base for PE_pcrel. */
+static uint64_t rd_va(const struct rdr *r) {
+	return r->base_va + (uint64_t)(r->p - r->base);
+}
+
+static uint8_t rd_u8(struct rdr *r) {
+	if (!rd_ok(r, 1)) return 0;
+	return *r->p++;
+}
+
+static uint64_t rd_fixed(struct rdr *r, size_t n) {
+	uint64_t v = 0;
+	if (!rd_ok(r, n)) return 0;
+	memcpy(&v, r->p, n); /* little-endian only, as everywhere else here */
+	r->p += n;
+	return v;
+}
+
+static uint64_t rd_uleb(struct rdr *r) {
+	uint64_t v = 0;
+	int s = 0;
+	for (;;) {
+		uint8_t b = rd_u8(r);
+		if (r->bad) return 0;
+		if (s < 64) v |= (uint64_t)(b & 0x7f) << s;
+		s += 7;
+		if (!(b & 0x80)) break;
+	}
+	return v;
+}
+
+static int64_t rd_sleb(struct rdr *r) {
+	int64_t v = 0;
+	int s = 0;
+	uint8_t b = 0;
+	do {
+		b = rd_u8(r);
+		if (r->bad) return 0;
+		if (s < 64) v |= (int64_t)(b & 0x7f) << s;
+		s += 7;
+	} while (b & 0x80);
+	if (s < 64 && (b & 0x40)) v |= -((int64_t)1 << s);
+	return v;
+}
+
+/* Bytes occupied by one PE-encoded value, or 0 if it is variable-length.
+ * A table whose entries are variable-length cannot be binary-searched. */
+static size_t enc_size(unsigned char enc) {
+	switch (PE_FMT(enc)) {
+	case 0x02: case 0x0a: return 2;
+	case 0x03: case 0x0b: return 4;
+	case 0x00: case 0x04: case 0x0c: return 8;
+	default: return 0;
+	}
+}
+
+/* One PE-encoded pointer. datarel is the base for DW_EH_PE_datarel, which is
+ * the .eh_frame_hdr address. pcrel is relative to the byte being read, which
+ * is why the cursor tracks a link-time address. */
+static uint64_t rd_enc(struct rdr *r, unsigned char enc, uint64_t datarel) {
+	uint64_t pos = rd_va(r), v = 0;
+	if (enc == PE_OMIT) return 0;
+	switch (PE_FMT(enc)) {
+	case 0x00: v = rd_fixed(r, 8); break;
+	case 0x01: v = rd_uleb(r); break;
+	case 0x02: v = rd_fixed(r, 2); break;
+	case 0x03: v = rd_fixed(r, 4); break;
+	case 0x04: v = rd_fixed(r, 8); break;
+	case 0x09: v = (uint64_t)rd_sleb(r); break;
+	case 0x0a: v = (uint64_t)(int64_t)(int16_t)rd_fixed(r, 2); break;
+	case 0x0b: v = (uint64_t)(int64_t)(int32_t)rd_fixed(r, 4); break;
+	case 0x0c: v = rd_fixed(r, 8); break;
+	default: r->bad = 1; return 0;
+	}
+	switch (PE_APP(enc)) {
+	case 0x00: break;
+	case 0x10: v += pos; break;     /* pcrel */
+	case 0x30: v += datarel; break; /* datarel */
+	default:
+		/* textrel, funcrel and aligned: not emitted on x86-64 by gcc or
+		 * clang, and guessing a base would name the wrong function. */
+		r->bad = 1;
+		return 0;
+	}
+	if (enc & PE_INDIRECT) r->bad = 1; /* needs the live GOT; refuse */
+	return v;
+}
+
+/* Step over a PE-encoded value without needing to understand its base. Used
+ * for the personality routine pointer, which is routinely PE_indirect. */
+static void rd_skip_enc(struct rdr *r, unsigned char enc) {
+	size_t n;
+	if (enc == PE_OMIT) return;
+	n = enc_size(enc);
+	if (n) {
+		if (rd_ok(r, n)) r->p += n;
+	} else if (PE_FMT(enc) == 0x01) {
+		rd_uleb(r);
+	} else if (PE_FMT(enc) == 0x09) {
+		rd_sleb(r);
+	} else {
+		r->bad = 1;
+	}
+}
+
+/* mmap one ELF file and check the header enough to index into it. Returns the
+ * mapping with *size set, or NULL. The caller munmaps. */
+static char *elf_map(const char *path, size_t *size, const Elf64_Ehdr **ehp) {
+	int fd = open(path, O_RDONLY);
 	struct stat st;
+	char *b;
+	const Elf64_Ehdr *eh;
+	if (fd < 0) return NULL;
 	if (fstat(fd, &st) < 0 || (size_t)st.st_size < sizeof(Elf64_Ehdr)) {
 		close(fd);
-		return;
+		return NULL;
 	}
-	char *b = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	b = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
 	close(fd);
-	if (b == MAP_FAILED) return;
-
-	const Elf64_Ehdr *eh = (const Elf64_Ehdr *)b;
+	if (b == MAP_FAILED) return NULL;
+	eh = (const Elf64_Ehdr *)b;
+	/* shortcut: 64-bit little-endian ELF only; no 32-bit, no cross-endian. */
 	if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 ||
 	    eh->e_ident[EI_CLASS] != ELFCLASS64 ||
-	    eh->e_shoff == 0 || eh->e_shentsize != sizeof(Elf64_Shdr) ||
-	    eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(Elf64_Shdr) > (uint64_t)st.st_size)
-		goto out; /* shortcut: 64-bit little-endian ELF only; no 32-bit, no cross-endian. */
+	    eh->e_phentsize != sizeof(Elf64_Phdr) ||
+	    eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(Elf64_Phdr) > (uint64_t)st.st_size) {
+		munmap(b, st.st_size);
+		return NULL;
+	}
+	*size = st.st_size;
+	*ehp = eh;
+	return b;
+}
 
+/* Read .eh_frame_hdr and .eh_frame out of a mapped ELF file into c. Returns 0
+ * and leaves c->ok == 0 for any object we cannot index: no PT_GNU_EH_FRAME,
+ * no search table, an encoding we do not implement. The caller then falls
+ * back to frame pointers for that object rather than inventing frames. */
+static int cfi_load(struct cfi *c, const char *b, size_t size, const Elf64_Ehdr *eh) {
+	const Elf64_Phdr *ph = (const Elf64_Phdr *)(b + eh->e_phoff);
+	uint64_t hva = 0, hoff = 0, hsz = 0, fva, n, fsz = 0, foff = 0;
+	unsigned char fptr_enc, cnt_enc, tab_enc;
+	size_t esz, toff;
+	struct rdr r;
+	int i;
+
+	memset(c, 0, sizeof *c);
+	for (i = 0; i < eh->e_phnum; i++)
+		if (ph[i].p_type == PT_GNU_EH_FRAME) {
+			hva = ph[i].p_vaddr;
+			hoff = ph[i].p_offset;
+			hsz = ph[i].p_filesz;
+		}
+	if (hsz < 4 || hoff + hsz > size) return 0;
+
+	r.base = r.p = (const unsigned char *)b + hoff;
+	r.end = r.base + hsz;
+	r.base_va = hva;
+	r.bad = 0;
+	if (rd_u8(&r) != 1) return 0; /* version; only 1 has ever existed */
+	fptr_enc = rd_u8(&r);
+	cnt_enc = rd_u8(&r);
+	tab_enc = rd_u8(&r);
+	fva = rd_enc(&r, fptr_enc, hva);
+	if (cnt_enc == PE_OMIT || tab_enc == PE_OMIT) return 0;
+	n = rd_enc(&r, cnt_enc, hva);
+	esz = enc_size(tab_enc);
+	toff = (size_t)(r.p - r.base);
+	if (r.bad || n == 0 || esz == 0) return 0;
+	if (n > (hsz - toff) / (2 * esz)) return 0;
+
+	/* .eh_frame's length is not in any program header, so take it from the
+	 * section header when there is one (exact), and otherwise from the end
+	 * of the containing PT_LOAD.
+	 *
+	 * shortcut: that fallback can include whatever follows .eh_frame in the
+	 * same segment. It costs nothing in correctness because a walk only ever
+	 * reaches those bytes through a length field in a CIE or FDE we chased
+	 * there, and every read is bounds-checked; the upgrade path is to stop at
+	 * the zero terminator the linker writes. Objects with section headers,
+	 * which includes every stripped distro library, take the exact path. */
+	if (eh->e_shoff && eh->e_shentsize == sizeof(Elf64_Shdr) &&
+	    eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(Elf64_Shdr) <= size) {
+		const Elf64_Shdr *sh = (const Elf64_Shdr *)(b + eh->e_shoff);
+		for (i = 0; i < eh->e_shnum; i++)
+			if (sh[i].sh_addr == fva && sh[i].sh_type == SHT_PROGBITS && sh[i].sh_size) {
+				fsz = sh[i].sh_size;
+				foff = sh[i].sh_offset;
+			}
+	}
+	if (!fsz)
+		for (i = 0; i < eh->e_phnum; i++)
+			if (ph[i].p_type == PT_LOAD && fva >= ph[i].p_vaddr &&
+			    fva < ph[i].p_vaddr + ph[i].p_filesz) {
+				foff = ph[i].p_offset + (fva - ph[i].p_vaddr);
+				fsz = ph[i].p_vaddr + ph[i].p_filesz - fva;
+			}
+	if (fsz < 4 || foff + fsz > size) return 0;
+
+	c->hdr = xmalloc(hsz);
+	memcpy(c->hdr, b + hoff, hsz);
+	c->frame = xmalloc(fsz);
+	memcpy(c->frame, b + foff, fsz);
+	c->hdrlen = hsz;
+	c->framelen = fsz;
+	c->hdr_va = hva;
+	c->frame_va = fva;
+	c->tab_off = toff;
+	c->ntab = n;
+	c->tab_enc = tab_enc;
+	c->tab_esz = esz;
+	c->ok = 1;
+#if PROF_PLANT_OVERREAD == 1
+	/* A deliberate one-byte over-read, built only by the prof-asan-plant1
+	 * target. The suite requires ASan to report it: that is the proof that
+	 * this buffer is sized to its data, and so that a REAL overrun in the CFI
+	 * parser would be reported too. With the sections left inside the file's
+	 * mmap, or copied into a rounded-up buffer, the read below is silently
+	 * fine and the sanitizer is off for everything in here. */
+	fprintf(stderr, "%s: planted over-read: %02x\n", prog, c->frame[c->framelen]);
+#endif
+	return 1;
+}
+
+static void cfi_free(struct cfi *c) {
+	free(c->hdr);
+	free(c->frame);
+	memset(c, 0, sizeof *c);
+}
+
+/* Binary search .eh_frame_hdr's sorted table for the last entry whose initial
+ * location is <= va, and return the FDE address it points at (0 if none).
+ * This is the whole reason .eh_frame_hdr exists: libc's .eh_frame holds
+ * around 18000 FDEs and a sampling profiler cannot scan them per sample. */
+static uint64_t cfi_lookup(const struct cfi *c, uint64_t va) {
+	size_t lo = 0, hi = (size_t)c->ntab, best = (size_t)-1, step = 2 * c->tab_esz;
+	struct rdr r;
+	uint64_t loc, fde;
+
+	r.base = c->hdr;
+	r.end = c->hdr + c->hdrlen;
+	r.base_va = c->hdr_va;
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		r.p = c->hdr + c->tab_off + mid * step;
+		r.bad = 0;
+		loc = rd_enc(&r, c->tab_enc, c->hdr_va);
+		if (r.bad) return 0;
+		if (loc <= va) {
+			best = mid;
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	if (best == (size_t)-1) return 0;
+	r.p = c->hdr + c->tab_off + best * step;
+	r.bad = 0;
+	rd_enc(&r, c->tab_enc, c->hdr_va);
+	fde = rd_enc(&r, c->tab_enc, c->hdr_va);
+	return r.bad ? 0 : fde;
+}
+
+struct cie {
+	uint64_t code_align;
+	int64_t data_align;
+	int ra_reg;
+	int has_z, sig;
+	unsigned char fde_enc;
+	const unsigned char *insn, *insn_end;
+};
+
+/* Point a cursor at a link-time address inside .eh_frame. */
+static int cfi_at(struct rdr *r, const struct cfi *c, uint64_t va) {
+	if (va < c->frame_va || va - c->frame_va >= c->framelen) return 0;
+	r->base = c->frame;
+	r->end = c->frame + c->framelen;
+	r->base_va = c->frame_va;
+	r->p = c->frame + (va - c->frame_va);
+	r->bad = 0;
+	return 1;
+}
+
+static int cie_parse(const struct cfi *c, uint64_t cva, struct cie *o) {
+	struct rdr r;
+	const unsigned char *end;
+	char aug[16];
+	size_t na = 0, i;
+	uint64_t len;
+	uint8_t ver;
+
+	if (!cfi_at(&r, c, cva)) return 0;
+	len = rd_fixed(&r, 4);
+	/* shortcut: 32-bit DWARF only. A 0xffffffff length introduces the 64-bit
+	 * form, which no x86-64 toolchain emits for .eh_frame; we refuse rather
+	 * than misread the fields that follow. */
+	if (len == 0 || len == 0xffffffffu || !rd_ok(&r, len)) return 0;
+	end = r.p + len;
+	if (rd_fixed(&r, 4) != 0) return 0; /* CIE id; nonzero means this is an FDE */
+	ver = rd_u8(&r);
+	if (ver != 1 && ver != 3) return 0;
+	for (;;) {
+		uint8_t ch = rd_u8(&r);
+		if (r.bad) return 0;
+		if (!ch) break;
+		if (na < sizeof aug - 1) aug[na++] = (char)ch;
+	}
+	aug[na] = 0;
+	/* An augmentation that does not start with 'z' carries no length, so
+	 * anything we do not recognise would leave the cursor in the wrong
+	 * place. Refuse the object instead. */
+	if (na && aug[0] != 'z') return 0;
+	o->code_align = rd_uleb(&r);
+	o->data_align = rd_sleb(&r);
+	o->ra_reg = ver == 1 ? (int)rd_u8(&r) : (int)rd_uleb(&r);
+	o->fde_enc = 0; /* absptr unless 'R' says otherwise */
+	o->sig = 0;
+	o->has_z = na > 0;
+	if (o->has_z) {
+		uint64_t alen = rd_uleb(&r);
+		const unsigned char *aend;
+		if (!rd_ok(&r, alen)) return 0;
+		aend = r.p + alen;
+		for (i = 1; i < na; i++) {
+			switch (aug[i]) {
+			case 'R': o->fde_enc = rd_u8(&r); break;
+			case 'P': rd_skip_enc(&r, rd_u8(&r)); break; /* personality */
+			case 'L': rd_u8(&r); break;                  /* LSDA encoding */
+			case 'S': o->sig = 1; break;
+			default: return 0;
+			}
+			if (r.bad) return 0;
+		}
+		r.p = aend; /* the length is authoritative over our walk of it */
+	}
+	if (r.bad || o->code_align == 0 || o->ra_reg >= CFI_NREG) return 0;
+	o->insn = r.p;
+	o->insn_end = end;
+	return 1;
+}
+
+static void setrule(struct row *w, uint64_t reg, int how, int64_t v) {
+	if (reg >= CFI_NREG) return; /* a register we never read; ignore the rule */
+	w->r[reg].how = (unsigned char)how;
+	w->r[reg].v = v;
+}
+
+/* Run a CFI opcode program, stopping at the first row whose location is past
+ * va. DWARF 5 section 6.4.2; the opcode numbering is stable back to DWARF 2. */
+static void cfi_exec(struct rdr *r, const struct cie *ci, uint64_t va,
+                     uint64_t *loc, struct row *cur, const struct row *init) {
+	struct row saved[8];
+	int depth = 0;
+
+	while (!r->bad && r->p < r->end) {
+		uint8_t op = rd_u8(r);
+		uint64_t adv, reg, u;
+		int64_t s;
+		if (r->bad) return;
+		switch (op >> 6) {
+		case 1: /* DW_CFA_advance_loc */
+			adv = op & 0x3f;
+			break;
+		case 2: /* DW_CFA_offset */
+			u = rd_uleb(r);
+			setrule(cur, op & 0x3f, RU_OFFSET, (int64_t)u * ci->data_align);
+			continue;
+		case 3: /* DW_CFA_restore */
+			if ((op & 0x3f) < CFI_NREG) cur->r[op & 0x3f] = init->r[op & 0x3f];
+			continue;
+		default:
+			switch (op) {
+			case 0x00: continue; /* nop */
+			case 0x01:           /* set_loc */
+				u = rd_enc(r, ci->fde_enc, 0);
+				if (r->bad || u > va) return;
+				*loc = u;
+				continue;
+			case 0x02: adv = rd_u8(r); break;
+			case 0x03: adv = rd_fixed(r, 2); break;
+			case 0x04: adv = rd_fixed(r, 4); break;
+			case 0x05: /* offset_extended */
+				reg = rd_uleb(r);
+				u = rd_uleb(r);
+				setrule(cur, reg, RU_OFFSET, (int64_t)u * ci->data_align);
+				continue;
+			case 0x06: /* restore_extended */
+				reg = rd_uleb(r);
+				if (reg < CFI_NREG) cur->r[reg] = init->r[reg];
+				continue;
+			case 0x07: setrule(cur, rd_uleb(r), RU_UNDEF, 0); continue;
+			case 0x08: setrule(cur, rd_uleb(r), RU_SAME, 0); continue;
+			case 0x09: /* register */
+				reg = rd_uleb(r);
+				u = rd_uleb(r);
+				setrule(cur, reg, RU_REG, (int64_t)u);
+				continue;
+			case 0x0a: /* remember_state */
+				if (depth < 8) saved[depth] = *cur;
+				depth++;
+				continue;
+			case 0x0b: /* restore_state */
+				if (depth > 0 && --depth < 8) *cur = saved[depth];
+				continue;
+			case 0x0c: /* def_cfa */
+				cur->cfa_reg = (int)rd_uleb(r);
+				cur->cfa_off = (int64_t)rd_uleb(r);
+				cur->cfa_exp = 0;
+				continue;
+			case 0x0d: /* def_cfa_register */
+				cur->cfa_reg = (int)rd_uleb(r);
+				cur->cfa_exp = 0;
+				continue;
+			case 0x0e: cur->cfa_off = (int64_t)rd_uleb(r); continue;
+			case 0x0f: /* def_cfa_expression */
+				u = rd_uleb(r);
+				cur->cfa_exp = 1;
+				if (rd_ok(r, u)) r->p += u;
+				continue;
+			case 0x10: /* expression */
+				reg = rd_uleb(r);
+				u = rd_uleb(r);
+				setrule(cur, reg, RU_EXPR, 0);
+				if (rd_ok(r, u)) r->p += u;
+				continue;
+			case 0x11: /* offset_extended_sf */
+				reg = rd_uleb(r);
+				s = rd_sleb(r);
+				setrule(cur, reg, RU_OFFSET, s * ci->data_align);
+				continue;
+			case 0x12: /* def_cfa_sf: offset is factored */
+				cur->cfa_reg = (int)rd_uleb(r);
+				cur->cfa_off = rd_sleb(r) * ci->data_align;
+				cur->cfa_exp = 0;
+				continue;
+			case 0x13: cur->cfa_off = rd_sleb(r) * ci->data_align; continue;
+			case 0x14: /* val_offset */
+				reg = rd_uleb(r);
+				u = rd_uleb(r);
+				setrule(cur, reg, RU_VAL_OFFSET, (int64_t)u * ci->data_align);
+				continue;
+			case 0x15: /* val_offset_sf */
+				reg = rd_uleb(r);
+				s = rd_sleb(r);
+				setrule(cur, reg, RU_VAL_OFFSET, s * ci->data_align);
+				continue;
+			case 0x16: /* val_expression */
+				reg = rd_uleb(r);
+				u = rd_uleb(r);
+				setrule(cur, reg, RU_VAL_EXPR, 0);
+				if (rd_ok(r, u)) r->p += u;
+				continue;
+			case 0x2d: continue;          /* GNU_window_save (sparc) */
+			case 0x2e: rd_uleb(r); continue; /* GNU_args_size */
+			case 0x2f:                    /* GNU_negative_offset_extended */
+				reg = rd_uleb(r);
+				u = rd_uleb(r);
+				setrule(cur, reg, RU_OFFSET, -(int64_t)u * ci->data_align);
+				continue;
+			default:
+				r->bad = 1; /* unknown opcode: stop, do not guess */
+				return;
+			}
+		}
+		/* An advance ends the current row. Stop before stepping past va, so
+		 * the row left in *cur is the one that covers it. */
+		if (r->bad) return;
+		if (*loc + adv * ci->code_align > va) return;
+		*loc += adv * ci->code_align;
+	}
+}
+
+/* The unwind row for link-time address va, or 0 if this object has no CFI
+ * covering it. va is a link-time address: the caller subtracts the load bias. */
+static int cfi_row(const struct cfi *c, uint64_t va, struct row *out) {
+	struct rdr f;
+	struct cie ci;
+	struct row cur, init;
+	const unsigned char *fend;
+	uint64_t len, cie_field_va, back, pc0, range, loc;
+
+	if (!c->ok) return 0;
+	if (!cfi_at(&f, c, cfi_lookup(c, va))) return 0;
+	len = rd_fixed(&f, 4);
+	if (len == 0 || len == 0xffffffffu || !rd_ok(&f, len)) return 0;
+	fend = f.p + len;
+	cie_field_va = rd_va(&f);
+	back = rd_fixed(&f, 4);
+	/* In .eh_frame (unlike .debug_frame) the CIE pointer is the distance
+	 * backwards from the pointer field itself, and zero means "this is a
+	 * CIE", which the search table should never point at. */
+	if (f.bad || back == 0 || back > cie_field_va - c->frame_va) return 0;
+	if (!cie_parse(c, cie_field_va - back, &ci)) return 0;
+	pc0 = rd_enc(&f, ci.fde_enc, c->hdr_va);
+	range = rd_enc(&f, PE_FMT(ci.fde_enc), 0); /* a length, never relocated */
+	if (f.bad || va < pc0 || va - pc0 >= range) return 0;
+	if (ci.has_z) {
+		uint64_t al = rd_uleb(&f);
+		if (!rd_ok(&f, al)) return 0;
+		f.p += al;
+	}
+
+	memset(&cur, 0, sizeof cur);
+	cur.cfa_reg = -1;
+	f.end = fend;
+
+	/* The CIE's instructions build the initial row, which is also what
+	 * DW_CFA_restore restores to. */
+	{
+		struct rdr k = f;
+		k.p = ci.insn;
+		k.end = ci.insn_end;
+		k.bad = 0;
+		loc = 0;
+		cfi_exec(&k, &ci, UINT64_MAX, &loc, &cur, &cur);
+		if (k.bad) return 0;
+	}
+	init = cur;
+	loc = pc0;
+	cfi_exec(&f, &ci, va, &loc, &cur, &init);
+	if (f.bad) return 0;
+	*out = cur;
+	return 1;
+}
+
+/* readelf --debug-dump=frames-interp's notation, so the two can be diffed. */
+static const char *dwreg_name(int r) {
+	static const char *n[] = {"rax", "rdx", "rcx", "rbx", "rsi", "rdi", "rbp",
+	                          "rsp", "r8", "r9", "r10", "r11", "r12", "r13",
+	                          "r14", "r15", "ra"};
+	return (r >= 0 && r < CFI_NREG) ? n[r] : "r?";
+}
+
+static void cfa_str(const struct row *w, char *b, size_t n) {
+	if (w->cfa_exp) snprintf(b, n, "exp");
+	else if (w->cfa_reg < 0) snprintf(b, n, "u");
+	else snprintf(b, n, "%s%+" PRId64, dwreg_name(w->cfa_reg), w->cfa_off);
+}
+
+static void rule_str(const struct rule *r, char *b, size_t n) {
+	switch (r->how) {
+	case RU_SAME: snprintf(b, n, "s"); break;
+	case RU_OFFSET: snprintf(b, n, "c%+" PRId64, r->v); break;
+	case RU_VAL_OFFSET: snprintf(b, n, "v%+" PRId64, r->v); break;
+	case RU_REG: snprintf(b, n, "r%" PRId64, r->v); break;
+	case RU_EXPR: snprintf(b, n, "exp"); break;
+	case RU_VAL_EXPR: snprintf(b, n, "vexp"); break;
+	default: snprintf(b, n, "u"); break;
+	}
+}
+
+/* --cfi-dump FILE: read hex addresses on stdin, print one row each, in
+ * readelf's notation. This exists so the CFI reader can be compared against
+ * an external authority directly, address by address, without a running
+ * target in the way; t/cfi_cmp.py drives it. */
+static int cfi_dump(const char *path) {
+	struct cfi c;
+	size_t size;
+	const Elf64_Ehdr *eh;
+	char *b = elf_map(path, &size, &eh), line[64];
+	int got;
+
+	if (!b) die("%s: not a 64-bit little-endian ELF file", path);
+	got = cfi_load(&c, b, size, eh);
+	munmap(b, size);
+	if (!got) die("%s: no usable .eh_frame_hdr search table", path);
+
+	/* One line per address: the address, the CFA rule, then the rule for
+	 * every register from 0 (rax) to 16 (ra) in DWARF numbering, which is the
+	 * order dwreg_name() lists. A lone "-" means no FDE covers the address.
+	 * All 17 are printed rather than just the two the unwinder reads, because
+	 * readelf prints a column for every register an FDE mentions and there is
+	 * no reason to compare fewer of them than the oracle offers. */
+	while (fgets(line, sizeof line, stdin)) {
+		uint64_t va = strtoull(line, NULL, 16);
+		struct row w;
+		char s[32];
+		if (!cfi_row(&c, va, &w)) {
+			printf("%016" PRIx64 " -\n", va);
+			continue;
+		}
+		cfa_str(&w, s, sizeof s);
+		printf("%016" PRIx64 " %s", va, s);
+		for (int k = 0; k < CFI_NREG; k++) {
+			rule_str(&w.r[k], s, sizeof s);
+			printf(" %s", s);
+		}
+		printf("\n");
+	}
+	cfi_free(&c);
+	return 0;
+}
+
+/* Parse .symtab (preferred), .dynsym and .eh_frame out of one ELF file by
+ * hand, from a single mapping of it. Returns the load bias; *c is filled with
+ * the object's CFI, with c->ok == 0 if it has none we can index. A file with
+ * no section headers at all still has CFI: that is the stripped-distro-library
+ * case, where the symbols are gone and the unwind tables are not. */
+static uint64_t load_object(const struct map *m, struct cfi *c) {
+	size_t size;
+	const Elf64_Ehdr *eh;
+	char *b = elf_map(m->path, &size, &eh);
+	if (!b) {
+		memset(c, 0, sizeof *c);
+		return 0;
+	}
 	uint64_t bias = load_bias(eh, b, m);
+	cfi_load(c, b, size, eh);
+
+	if (eh->e_shoff == 0 || eh->e_shentsize != sizeof(Elf64_Shdr) ||
+	    eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(Elf64_Shdr) > (uint64_t)size)
+		goto out;
+
 	const Elf64_Shdr *sh = (const Elf64_Shdr *)(b + eh->e_shoff);
 
 	for (int i = 0; i < eh->e_shnum; i++) {
 		if (sh[i].sh_type != SHT_SYMTAB && sh[i].sh_type != SHT_DYNSYM) continue;
 		if (sh[i].sh_entsize != sizeof(Elf64_Sym) || sh[i].sh_link >= eh->e_shnum) continue;
 		const Elf64_Shdr *strs = &sh[sh[i].sh_link];
-		if (sh[i].sh_offset + sh[i].sh_size > (uint64_t)st.st_size) continue;
-		if (strs->sh_offset + strs->sh_size > (uint64_t)st.st_size) continue;
+		if (sh[i].sh_offset + sh[i].sh_size > (uint64_t)size) continue;
+		if (strs->sh_offset + strs->sh_size > (uint64_t)size) continue;
 
 		const Elf64_Sym *sy = (const Elf64_Sym *)(b + sh[i].sh_offset);
 		size_t n = sh[i].sh_size / sizeof(Elf64_Sym);
@@ -234,7 +939,8 @@ static void load_elf_syms(const struct map *m) {
 		if (sh[i].sh_type == SHT_SYMTAB) break;
 	}
 out:
-	munmap(b, st.st_size);
+	munmap(b, size);
+	return bias;
 }
 
 static const char *base_name(const char *p) {
@@ -250,12 +956,14 @@ static const char *base_name(const char *p) {
  *
  * Objects whose symbols we have already pulled in, keyed by path + load skew,
  * so that re-reading /proc/PID/maps is cheap and idempotent. */
-struct done {
+struct obj {
 	char path[PATH_MAX];
-	uint64_t skew;
+	uint64_t skew; /* start - pgoff: identifies this mapping of this file */
+	uint64_t bias; /* runtime address = link-time address + bias */
+	struct cfi cfi;
 };
-static struct done done_list[512];
-static int ndone;
+static struct obj objs[512];
+static int nobjs;
 
 /* Re-read the target's executable mappings and pull in symbols for any object
  * we have not seen before.
@@ -294,6 +1002,7 @@ static int refresh_maps(pid_t pid) {
 		maps[n].start = s;
 		maps[n].end = e;
 		maps[n].pgoff = off;
+		maps[n].obj = -1;
 		snprintf(maps[n].path, PATH_MAX, "%s", p);
 		n++;
 	}
@@ -303,17 +1012,16 @@ static int refresh_maps(pid_t pid) {
 
 	for (int i = 0; i < nmaps; i++) {
 		uint64_t skew = maps[i].start - maps[i].pgoff;
-		int seen = 0;
-		for (int j = 0; j < ndone; j++)
-			if (done_list[j].skew == skew && strcmp(done_list[j].path, maps[i].path) == 0)
-				seen = 1;
-		if (seen) continue;
-		if (ndone < (int)(sizeof done_list / sizeof *done_list)) {
-			snprintf(done_list[ndone].path, PATH_MAX, "%s", maps[i].path);
-			done_list[ndone].skew = skew;
-			ndone++;
-		}
-		load_elf_syms(&maps[i]);
+		for (int j = 0; j < nobjs; j++)
+			if (objs[j].skew == skew && strcmp(objs[j].path, maps[i].path) == 0)
+				maps[i].obj = j;
+		if (maps[i].obj >= 0) continue;
+		if (nobjs == (int)(sizeof objs / sizeof *objs)) continue;
+		struct obj *o = &objs[nobjs];
+		snprintf(o->path, PATH_MAX, "%s", maps[i].path);
+		o->skew = skew;
+		maps[i].obj = nobjs++;
+		o->bias = load_object(&maps[i], &o->cfi);
 		added = 1;
 	}
 	if (added) qsort(syms, nsyms, sizeof *syms, sym_cmp);
@@ -338,6 +1046,20 @@ static int in_text(uint64_t a) {
 	for (int i = 0; i < nmaps; i++)
 		if (a >= maps[i].start && a < maps[i].end) return 1;
 	return 0;
+}
+
+/* The CFI of whatever object is mapped over a, with its load bias, or NULL.
+ * This is the per-mapping unwinder choice: an object whose .eh_frame we could
+ * index unwinds with CFI, and one we could not falls back to frame pointers,
+ * which the summary line reports as a frame count per method rather than
+ * leaving the reader to guess which they got. */
+static const struct cfi *cfi_for(uint64_t a, uint64_t *bias) {
+	for (int i = 0; i < nmaps; i++)
+		if (a >= maps[i].start && a < maps[i].end && maps[i].obj >= 0) {
+			*bias = objs[maps[i].obj].bias;
+			return &objs[maps[i].obj].cfi;
+		}
+	return NULL;
 }
 
 /* Greatest symbol whose address is <= a. Falls back to the module basename so
@@ -393,6 +1115,7 @@ struct ring {
 static struct ring *rings;
 static int nrings;
 static uint64_t n_samples, n_lost, n_trunc;
+static uint64_t n_cfi_frames, n_fp_frames, n_fp_samples;
 static struct tab folded, flat;
 
 static long perf_open(struct perf_event_attr *a, pid_t pid, int cpu) {
@@ -422,13 +1145,34 @@ static void drain(struct ring *r) {
 	__atomic_thread_fence(__ATOMIC_ACQUIRE); /* pairs with the kernel's store-release of data_head */
 	uint64_t tail = r->meta->data_tail;
 
-	static unsigned char rec[1 << 16];
+	/* Sized to exactly h.size, not left at the u16 maximum.
+	 *
+	 * This buffer used to be a fixed 64 KB array, which meant a parse bug
+	 * reading one byte past the end of a 4 KB sample landed 60 KB inside a
+	 * live object and no sanitizer could possibly see it: a buffer larger
+	 * than its data turns ASan off for everything inside it. Every sample in
+	 * a run is the same size, so the realloc happens once. t/run.sh plants
+	 * exactly that over-read and requires ASan to report it, so going back to
+	 * a rounded-up buffer turns the suite red rather than quietly turning the
+	 * sanitizer off. */
+	static unsigned char *rec;
+	static size_t reccap;
 	while (tail < head) {
 		struct perf_event_header h;
 		ring_copy(r, tail, &h, sizeof h);
-		/* h.size is a u16, so it always fits rec[]; a zero size would loop forever. */
+		/* A zero size would loop forever. */
 		if (h.size < sizeof h) break;
+		if (h.size != reccap) {
+			unsigned char *nr = realloc(rec, h.size);
+			if (!nr) die("out of memory");
+			rec = nr;
+			reccap = h.size;
+		}
 		ring_copy(r, tail, rec, h.size);
+#if PROF_PLANT_OVERREAD == 2
+		/* The same planted over-read for the record buffer; see plant 1. */
+		fprintf(stderr, "%s: planted over-read: %02x\n", prog, rec[h.size]);
+#endif
 		tail += h.size;
 		if (h.type == PERF_RECORD_SAMPLE)
 			handle_sample(rec + sizeof h, h.size - sizeof h);
@@ -448,6 +1192,63 @@ static uint64_t ld64(const unsigned char *p) {
 	uint64_t v;
 	memcpy(&v, p, 8);
 	return v;
+}
+
+/* Read 8 bytes of the captured stack. The kernel copies len bytes starting at
+ * the sampled RSP; an address outside that window was never captured, so the
+ * walk stops there and is counted as a truncation rather than guessed at. */
+static int stk_read(const unsigned char *s, uint64_t base, uint64_t len,
+                    uint64_t a, uint64_t *v) {
+	if (a < base || a - base + 8 > len) return 0;
+	*v = ld64(s + (a - base));
+	return 1;
+}
+
+enum { UNW_OK, UNW_NOCFI, UNW_STOP };
+
+/* One CFI unwind step. pc is the address to look up: the sampled RIP for the
+ * innermost frame, and (return address - 1) above it, because a return address
+ * points after the call and can even be one past the end of the function.
+ *
+ * On UNW_OK, *ra is the caller's return address and sp/bp have been moved into
+ * the caller's frame. UNW_NOCFI means this object has no CFI covering pc, or
+ * has a rule this code does not evaluate, so the caller should try frame
+ * pointers. UNW_STOP means the chain genuinely ends here: an undefined
+ * return-address rule is how the CIE of a thread entry point says "outermost",
+ * and a read outside the captured stack means the rest was never sampled. */
+static int cfi_step(uint64_t pc, uint64_t *sp, uint64_t *bp, uint64_t *ra,
+                    const unsigned char *stk, uint64_t base, uint64_t len) {
+	uint64_t bias = 0, cfa, v;
+	const struct cfi *c = cfi_for(pc, &bias);
+	struct row w;
+
+	if (no_cfi || !c || !c->ok || !cfi_row(c, pc - bias, &w)) return UNW_NOCFI;
+	if (w.cfa_exp) return UNW_NOCFI; /* a DWARF expression CFA: not evaluated */
+	if (w.cfa_reg == DW_RSP) cfa = *sp + (uint64_t)w.cfa_off;
+	else if (w.cfa_reg == DW_RBP) cfa = *bp + (uint64_t)w.cfa_off;
+	else return UNW_NOCFI; /* only three registers were sampled */
+
+	switch (w.r[DW_RA].how) {
+	case RU_OFFSET:
+		if (!stk_read(stk, base, len, cfa + (uint64_t)w.r[DW_RA].v, ra))
+			return UNW_STOP;
+		break;
+	case RU_UNDEF:
+	case RU_SAME:
+		return UNW_STOP;
+	default:
+		return UNW_NOCFI;
+	}
+	/* RBP only matters for the next step, and only if that frame's CFA is
+	 * RBP-relative, but it is two lines to keep right. No rule for a
+	 * callee-saved register means the callee left it alone. */
+	if (w.r[DW_RBP].how == RU_OFFSET) {
+		if (stk_read(stk, base, len, cfa + (uint64_t)w.r[DW_RBP].v, &v)) *bp = v;
+	} else if (w.r[DW_RBP].how == RU_VAL_OFFSET) {
+		*bp = cfa + (uint64_t)w.r[DW_RBP].v;
+	}
+	*sp = cfa; /* the CFA is the caller's stack pointer, by definition */
+	return UNW_OK;
 }
 
 /* Sample layout, in the fixed order documented in perf_event_open(2):
@@ -474,35 +1275,67 @@ static void handle_sample(const unsigned char *p, size_t len) {
 	if (p + 8 > end) return;
 	uint64_t ssize = ld64(p);
 	p += 8;
-	if (ssize > (uint64_t)(end - p)) return;
+	/* ssize bytes of stack, then the u64 dyn_size that says how many of them
+	 * the kernel really filled. The +8 is the point: checking only ssize let
+	 * the dyn_size read run 8 bytes past the record, which was invisible while
+	 * the record buffer was a fixed 64 KB array. */
+	if (ssize + 8 > (uint64_t)(end - p)) return;
 	const unsigned char *stack = p;
 	uint64_t dyn = ssize >= 8 ? ld64(p + ssize) : 0; /* bytes actually captured */
 	if (dyn > ssize) dyn = ssize;
 
 	n_samples++;
 
-	/* Frame-pointer walk. Leaf first; reversed below for output. */
+	/* The walk. CFI first for every frame, because frame pointers are absent
+	 * from every -O2 build and from the whole of a distro libc; the saved-RBP
+	 * chain is the fallback for an object whose .eh_frame we could not index.
+	 * Which one produced each frame is counted and reported, so a profile that
+	 * silently degraded is visible in the output instead of being inferred.
+	 *
+	 * Leaf frame first; reversed below for output. */
 	uint64_t fr[MAX_DEPTH];
-	int nf = 0;
+	uint64_t sp0 = sp; /* the stack window starts at the sampled RSP */
+	int nf = 0, fell_back = 0;
 	fr[nf++] = ip;
+	uint64_t pc = ip;
 	for (int d = 0; d < MAX_DEPTH - 1; d++) {
-		if (bp < sp) break;
-		uint64_t off = bp - sp;
-		if (off + 16 > dyn) { /* the frame we need is past the bytes the kernel copied */
-			n_trunc++;
-			break;
+		uint64_t ra = 0;
+		int last = 0;
+		int st = cfi_step(pc, &sp, &bp, &ra, stack, sp0, dyn);
+		if (st == UNW_STOP) break;
+		if (st == UNW_NOCFI) {
+			/* Frame-pointer fallback: the saved RBP and the return address
+			 * sit at [rbp] and [rbp+8] once the prologue has run. */
+			if (bp < sp0 || bp - sp0 + 16 > dyn) {
+				if (bp >= sp0) n_trunc++; /* past the bytes the kernel copied */
+				break;
+			}
+			uint64_t next = ld64(stack + (bp - sp0));
+			ra = ld64(stack + (bp - sp0) + 8);
+			/* The chain must grow toward the stack base. When it does not we
+			 * have reached the outermost frame that has one, so this return
+			 * address is still good and only the step after it is not. */
+			if (next <= bp) last = 1;
+			sp = bp + 16;
+			bp = next;
 		}
-		uint64_t next = ld64(stack + off), ret = ld64(stack + off + 8);
-		/* A return address must land in a mapped executable region. On a libc
-		 * frame built without frame pointers, RBP holds live data instead of a
-		 * saved RBP, and this check is what stops us walking nonsense. */
-		if (!ret || !in_text(ret)) break;
-		/* ret points *after* the call instruction; step back so the address
+		/* A return address must land in a mapped executable region. On a frame
+		 * built without frame pointers RBP holds live data instead of a saved
+		 * RBP, and this is what stops the fallback walking nonsense. */
+		if (!ra || !in_text(ra)) break;
+		if (st == UNW_OK) {
+			n_cfi_frames++;
+		} else {
+			n_fp_frames++;
+			fell_back = 1;
+		}
+		/* ra points *after* the call instruction; step back so the address
 		 * attributes to the call site and not to whatever follows it. */
-		fr[nf++] = ret - 1;
-		if (next <= bp) break; /* the chain must strictly grow toward the stack base */
-		bp = next;
+		pc = ra - 1;
+		fr[nf++] = pc;
+		if (last) break;
 	}
+	if (fell_back) n_fp_samples++;
 
 	/* Resolve, build the folded key outermost-first, and tally the flat table. */
 	const char *names[MAX_DEPTH];
@@ -597,19 +1430,31 @@ static void usage(void) {
 	        "usage: %s [-F HZ] [-o FILE] [--folded] -- ./prog [args...]\n"
 	        "  -F HZ      sample frequency, default 997\n"
 	        "  -o FILE    write the profile here (default: stderr)\n"
-	        "  --folded   collapsed stacks (\"main;foo;bar 42\") instead of a flat profile\n",
+	        "  --folded   collapsed stacks (\"main;foo;bar 42\") instead of a flat profile\n"
+	        "\n"
+	        "  --no-cfi   unwind with frame pointers only, ignoring .eh_frame. For\n"
+	        "             the test suite: it shows what the fallback alone recovers.\n"
+	        "\n"
+	        "  --cfi-dump FILE   read hex addresses on stdin, print the .eh_frame\n"
+	        "                    unwind row for each in readelf's notation. A debug\n"
+	        "                    mode, and the hook the test suite uses to diff this\n"
+	        "                    CFI reader against readelf --debug-dump=frames-interp.\n",
 	        prog);
 	exit(2);
 }
 
 int main(int argc, char **argv) {
 	int hz = 997, want_folded = 0;
+	/* Checked before anything else because it profiles nothing: it reads one
+	 * ELF file and prints unwind rows. */
+	if (argc == 3 && !strcmp(argv[1], "--cfi-dump")) return cfi_dump(argv[2]);
 	const char *out = NULL;
 	int i = 1;
 
 	for (; i < argc; i++) {
 		if (!strcmp(argv[i], "--")) { i++; break; }
 		else if (!strcmp(argv[i], "--folded")) want_folded = 1;
+		else if (!strcmp(argv[i], "--no-cfi")) no_cfi = 1;
 		else if (!strcmp(argv[i], "-F") && i + 1 < argc) hz = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
 		else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) usage();
@@ -729,6 +1574,9 @@ int main(int argc, char **argv) {
 	}
 	/* The child is gone but its last samples are still in the rings. */
 	for (int c = 0; c < nrings; c++) drain(&rings[c]);
+	free(pfds); /* LeakSanitizer reports it otherwise, and the suite runs
+	             * a clean ASan build as an assertion, so a known leak would
+	             * have to be either fixed or excused. This one was real. */
 
 	FILE *o = stderr;
 	if (out) {
@@ -744,6 +1592,9 @@ int main(int argc, char **argv) {
 	fprintf(stderr, "%s: %" PRIu64 " samples, %" PRIu64 " lost, %" PRIu64
 	                " truncated stacks, %s @ %d Hz, %d/%d cpus\n",
 	        prog, n_samples, n_lost, n_trunc, evname, hz, nrings, ncpu);
+	fprintf(stderr, "%s: unwind: %" PRIu64 " frames via .eh_frame CFI, %" PRIu64
+	                " via frame pointers (%" PRIu64 "/%" PRIu64 " samples fell back)\n",
+	        prog, n_cfi_frames, n_fp_frames, n_fp_samples, n_samples);
 	if (n_samples == 0)
 		fprintf(stderr, "%s: no samples -- target too short-lived, or off-CPU the whole time\n", prog);
 

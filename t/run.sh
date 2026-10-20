@@ -244,5 +244,143 @@ else
 	bad "ring buffer: samples were dropped at 1997 Hz" "$lost lost -- drain loop is too slow"
 fi
 
+# --- 8. DWARF .eh_frame CFI, against readelf --------------------------------
+# readelf --debug-dump=frames-interp prints the interpreted CFI table for every
+# FDE in a file: one row per address at which the unwind rules change, with a
+# column for the CFA and one per callee-saved register. prof --cfi-dump prints
+# the same rows in the same notation for whatever addresses it is given, so the
+# two can be diffed directly, with no running target and no profile in the way.
+#
+# The count is printed and asserted, not just the exit status. A comparison of
+# zero rows passes every other assertion in this group.
+LIBC=$(ldd $PROF 2>/dev/null | awk '/libc\.so/{print $3}')
+if ! command -v readelf >/dev/null 2>&1; then
+	skip "cfi: unwind rows match readelf" "readelf is the only oracle for this group"
+elif ! command -v python3 >/dev/null 2>&1; then
+	skip "cfi: unwind rows match readelf" "python3 needed to drive the comparison"
+else
+	# prof and both workloads are gcc -O2/-O1 output; libc is a stripped,
+	# hand-written-asm-containing, 3900-FDE optimised library, which is where
+	# the rules this parser does not expect actually live.
+	if python3 t/cfi_cmp.py $PROF $PROF $WL t/workload_nofp t/cfi_probe $LIBC >"$TMP/cfi" 2>&1; then
+		rows=$(sed -n 's/^cfi vs readelf: \([0-9]*\) rows agree.*/\1/p' "$TMP/cfi")
+		[ -n "$rows" ] || rows=0
+		if [ "$rows" -ge 1000 ]; then
+			ok "cfi: $(cat "$TMP/cfi")"
+		else
+			bad "cfi: too few rows compared to mean anything" "$(cat "$TMP/cfi")"
+		fi
+	else
+		bad "cfi: unwind rows must match readelf" "$(tail -6 "$TMP/cfi")"
+	fi
+fi
+
+# --- 9. the chain gdb finds in a binary with no frame pointers -------------
+# t/workload_nofp is built -O2 -fomit-frame-pointer, i.e. the way every distro
+# binary is built: there is no saved-RBP chain to walk at all. gdb reads the
+# same .eh_frame and prints the true chain, so gdb is the oracle and the
+# expected chain is taken FROM IT rather than written here.
+NFP=t/workload_nofp
+if ! command -v gdb >/dev/null 2>&1; then
+	skip "cfi: reproduces gdb's backtrace on an fp-less binary" "gdb not installed"
+elif [ ! -x $NFP ]; then
+	bad "cfi: reproduces gdb's backtrace on an fp-less binary" "$NFP not built"
+else
+	# gdb prints innermost first; a folded stack is outermost first.
+	chain=$(gdb -batch -ex 'break hot' -ex 'run 1' -ex bt $NFP 2>/dev/null |
+	        awk '/^#[0-9]/ { print ($2 ~ /^0x/) ? $4 : $2 }' |
+	        awk '{ f[++k]=$1 } END { s=""; for (i=k; i>=1; i--) s = s (s?";":"") f[i]; print s }')
+	depth=$(printf '%s' "$chain" | awk -F';' '{print NF}')
+	[ -n "$depth" ] || depth=0
+	$PROF --folded -o "$TMP/nofp.fold" -- $NFP 1 >/dev/null 2>"$TMP/nofp.err"
+	cfif=$(sed -n 's/^prof: unwind: \([0-9]*\) frames via .eh_frame CFI, \([0-9]*\) via.*/\1/p' "$TMP/nofp.err")
+	fpf=$(sed -n 's/^prof: unwind: \([0-9]*\) frames via .eh_frame CFI, \([0-9]*\) via.*/\2/p' "$TMP/nofp.err")
+	if [ "$depth" -lt 4 ]; then
+		# An empty chain would make the grep below match every line, so this
+		# guard is the whole test: "" is a substring of anything.
+		bad "cfi: reproduces gdb's backtrace on an fp-less binary" \
+		    "gdb gave a $depth-frame chain ('$chain'); expected at least main;level1;level2;hot"
+	elif [ -z "$cfif" ] || [ -z "$fpf" ]; then
+		bad "cfi: reproduces gdb's backtrace on an fp-less binary" \
+		    "could not read the per-method frame counts from prof's summary"
+	elif ! grep -Fq "$chain " "$TMP/nofp.fold"; then
+		bad "cfi: reproduces gdb's backtrace on an fp-less binary" \
+		    "gdb says $chain; prof folded output: $(head -1 "$TMP/nofp.fold")"
+	elif [ "$cfif" -le 0 ]; then
+		# Assert the new path RAN. Without this the case passes if some other
+		# unwinder happens to find the chain.
+		bad "cfi: the chain must come from CFI" "0 frames came via .eh_frame"
+	elif [ "$fpf" -ne 0 ]; then
+		bad "cfi: an fp-less binary must need no fp fallback" "$fpf frames came from the RBP walk"
+	else
+		ok "cfi: reproduces gdb's $chain on an fp-less binary ($cfif frames via CFI, $fpf via fp)"
+	fi
+
+	# ... and the same run with CFI switched off, which is what makes the case
+	# above a claim about CFI rather than about the chain being easy to find.
+	$PROF --no-cfi --folded -o "$TMP/nofp.nocfi" -- $NFP 1 >/dev/null 2>&1
+	deep=$(awk -F';' 'NF>1' "$TMP/nofp.nocfi" | wc -l)
+	lines=$(wc -l < "$TMP/nofp.nocfi")
+	if [ "$lines" -gt 0 ] && [ "$deep" -eq 0 ]; then
+		ok "cfi: --no-cfi on the same binary collapses to depth 1 ($lines stacks, none deeper)"
+	else
+		bad "cfi: --no-cfi on the same binary must collapse to depth 1" \
+		    "$lines stacks, $deep of them deeper than one frame -- so the case above proves nothing"
+	fi
+fi
+
+# --- 10. the per-mapping unwinder choice, and the fallback -----------------
+# t/workload_nocfi has frame pointers and NO unwind tables, so prof must notice
+# per address that there is no CFI, fall back to the RBP walk, still produce the
+# right chain, and say in the summary which unwinder it used.
+NOC=t/workload_nocfi
+if [ ! -x $NOC ]; then
+	bad "unwinder choice: falls back to frame pointers without .eh_frame" "$NOC not built"
+else
+	$PROF --folded -o "$TMP/noc.fold" -- $NOC 1 >/dev/null 2>"$TMP/noc.err"
+	cfif=$(sed -n 's/^prof: unwind: \([0-9]*\) frames via .eh_frame CFI, \([0-9]*\) via.*/\1/p' "$TMP/noc.err")
+	fpf=$(sed -n 's/^prof: unwind: \([0-9]*\) frames via .eh_frame CFI, \([0-9]*\) via.*/\2/p' "$TMP/noc.err")
+	if [ -z "$cfif" ] || [ -z "$fpf" ]; then
+		bad "unwinder choice: falls back to frame pointers without .eh_frame" \
+		    "no per-method frame counts in prof's summary"
+	elif ! grep -Fq 'main;level1;level2;hot ' "$TMP/noc.fold"; then
+		bad "unwinder choice: the fallback must still find the chain" \
+		    "$(head -1 "$TMP/noc.fold")"
+	elif [ "$fpf" -le 0 ]; then
+		bad "unwinder choice: the fallback must have been used" "$fpf frames from the RBP walk"
+	else
+		ok "unwinder choice: no .eh_frame for this object, $fpf frames from the RBP walk and the chain is still right"
+	fi
+fi
+
+# --- 11. the sanitizer can see past the ends of the CFI buffers ------------
+# A buffer larger than its data turns ASan off for everything inside it. The
+# .eh_frame copy and the ring-buffer record are therefore sized to the byte,
+# and these three cases are what keeps that true: a clean run, plus two builds
+# with a deliberate one-byte over-read that ASan MUST report. Verified by
+# rounding either buffer back up, at which point both plants go unreported.
+for plant in 0 1 2; do
+	case $plant in
+	0) bin=./prof-asan;        want=clean; label="asan: the CFI path is clean under AddressSanitizer" ;;
+	1) bin=./prof-asan-plant1; want=report; label="asan: an over-read past the .eh_frame copy is reported" ;;
+	2) bin=./prof-asan-plant2; want=report; label="asan: an over-read past the sample record is reported" ;;
+	esac
+	if [ ! -x "$bin" ]; then
+		bad "$label" "$bin not built (make test builds it)"
+		continue
+	fi
+	$bin --folded -o "$TMP/asan.fold" -- $NFP 1 >/dev/null 2>"$TMP/asan.err"
+	n=$(grep -c 'AddressSanitizer' "$TMP/asan.err")
+	if [ "$want" = clean ] && [ "$n" -eq 0 ]; then
+		ok "$label"
+	elif [ "$want" = report ] && grep -q 'heap-buffer-overflow' "$TMP/asan.err"; then
+		ok "$label"
+	elif [ "$want" = clean ]; then
+		bad "$label" "$(grep -m1 'AddressSanitizer' "$TMP/asan.err")"
+	else
+		bad "$label" "the planted over-read was NOT reported: the buffer is bigger than its data"
+	fi
+done
+
 printf '\n%d passed, %d failed, %d skipped\n' "$P" "$F" "$S"
 [ "$F" -eq 0 ]

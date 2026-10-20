@@ -12,7 +12,10 @@ second, and writes a profile of where it spent CPU time.
   `enable_on_exec=1`, `exclude_kernel=1`. The summary line names which event
   was used; `prof` never claims a mechanism it did not get.
 - Stacks come from `PERF_SAMPLE_REGS_USER` + `PERF_SAMPLE_STACK_USER` and a
-  frame-pointer (saved-RBP) walk done in `prof`, not by the kernel.
+  walk done in `prof`, not by the kernel: DWARF `.eh_frame` CFI where the
+  object has an indexable `.eh_frame_hdr`, a frame-pointer (saved-RBP) walk
+  where it does not. The summary line reports how many frames came from each,
+  so a degraded profile says so instead of looking like a shallow one.
 - Symbols come from `.symtab`, falling back to `.dynsym`, parsed from the ELF
   files named in `/proc/PID/maps`; unresolvable addresses print as
   `module+0xoffset`, never as a silent blank.
@@ -42,8 +45,10 @@ Two of them, and every commit is checked against both:
 
 ## Oracle
 
-Ranked by how much a failure would matter. All of it is ground truth we
-construct, none of it is a comparison against another profiler.
+Ranked by how much a failure would matter. Items 1 to 7 are ground truth we
+construct; 8 to 10 are outside authorities on DWARF, which is a format we do
+not get to have an opinion about. None of it is a comparison against another
+profiler.
 
 1. Transparency: target stdout byte-identical, exit status `7` preserved,
    `-o FILE` keeps the profile out of stdout. A profiler you cannot trust not
@@ -66,6 +71,20 @@ construct, none of it is a comparison against another profiler.
    assertion above would happily pass.
 7. No silent loss: `PERF_RECORD_LOST` reports zero at 1997 Hz, proving the
    non-blocking drain loop keeps up with the kernel.
+8. `readelf --debug-dump=frames-interp` on the unwind tables. It prints the
+   interpreted CFI table row by row; `prof --cfi-dump` prints the same rows in
+   the same notation and `t/cfi_cmp.py` diffs every column, counting wrong
+   answers and refusals separately. 818786 rows agree across python3, gdb,
+   libstdc++, libc, libm and ld.so, with the addresses in the gaps between
+   FDEs required to yield no rules at all.
+9. `gdb`'s `backtrace` on a binary built `-O2 -fomit-frame-pointer`, where
+   there is no RBP chain to walk. The expected chain is taken from gdb's
+   output, not written into the test, and the same run with `--no-cfi` must
+   collapse to depth 1: otherwise the case is about the chain being easy to
+   find rather than about CFI finding it.
+10. `gas`, for the CFI opcodes no real binary emits. `t/cfi_probe.s` writes
+   them by hand; gas encodes them and readelf says what they mean. Three
+   mutations survived 73246 agreeing rows before this existed.
 
 Harness prints `N passed, M failed, K skipped` and exits nonzero on any
 failure. It skips (not passes) with a printed reason if `perf_event_open`
@@ -171,17 +190,29 @@ is worth having in history, not described from memory.
 
 ### Milestone 1: make it work on real optimised binaries
 
-- [ ] DWARF `.eh_frame` CFI unwinding: parse `.eh_frame_hdr`'s binary search
+- [x] DWARF `.eh_frame` CFI unwinding: parse `.eh_frame_hdr`'s binary search
       table, decode CIE/FDE, run the CFA program for the sampled PC, recover
       the caller's PC/SP/BP from the captured stack.
       why: this is the one that matters. Every system binary and every
       `-O2` build omits frame pointers, so today `prof` produces depth-1 stacks
       for anything it did not compile itself: the flat profile is right and
       the flamegraph is useless. Nothing else on this list is worth doing first.
-- [ ] Register the unwinder choice per mapping: CFI where `.eh_frame` exists,
+      done: `python3` goes from 131 stacks of maximum depth 1 to 137 of maximum
+      depth 44. 818786 rows agree with `readelf --debug-dump=frames-interp`
+      across six system binaries, 0 wrong and 0 refused, and prof reproduces
+      gdb's backtrace of an `-O2 -fomit-frame-pointer` build. `t/cfi_probe.s`
+      covers the seven opcodes no installed binary emits, after three mutations
+      survived without it. Both buffers it reads are sized to the byte, with a
+      planted over-read in the suite requiring ASan to see past each: rounded
+      up, both plants are reported zero times.
+- [x] Register the unwinder choice per mapping: CFI where `.eh_frame` exists,
       frame pointers as the fallback, and report per-sample which was used.
       why: a profiler that silently degrades is how you end up believing a
       wrong flamegraph; the degradation should be visible in the output.
+      done: a second summary line counts frames by method and samples that
+      needed the fallback. `t/workload_nocfi` is built
+      `-fno-asynchronous-unwind-tables` so the suite can assert the fallback
+      ran (2666 frames) and still found the planted chain.
 - [ ] Consume `PERF_RECORD_MMAP2`/`COMM`/`FORK`/`EXIT` from the ring buffer
       instead of polling `/proc/PID/maps`.
       why: removes the last race and the last reason we need the target to
