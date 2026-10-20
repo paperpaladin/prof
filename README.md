@@ -1,6 +1,6 @@
 # prof
 
-A sampling CPU profiler in ~1600 lines of C11 that drives `perf_event_open(2)` itself, unwinds with DWARF `.eh_frame` CFI (frame pointers only as a fallback), reads symbols straight out of the ELF `.symtab`/`.dynsym`, and prints a flat profile or flamegraph-ready collapsed stacks.
+A sampling CPU profiler in ~1800 lines of C11 that drives `perf_event_open(2)` itself, unwinds with DWARF `.eh_frame` CFI (frame pointers only as a fallback), reads symbols straight out of the ELF `.symtab`/`.dynsym`, and prints a flat profile or flamegraph-ready collapsed stacks.
 
 ```
 prof [-F HZ] [-o FILE] [--folded] [--no-cfi] -- ./prog args...
@@ -221,7 +221,7 @@ Pipe the folded form straight into a flamegraph:
 
 - `/proc/sys/kernel/perf_event_paranoid` = 2
 - kernel 7.2.8-200.fc44.x86_64, unprivileged uid 1000, no root, no sysctl changed
-- `/proc/sys/kernel/perf_event_max_sample_rate` = 6000 here (so `-F` above that is rejected by the kernel; `prof` says so). The kernel auto-throttles this sysctl, so it moves on its own, it read 14000 when this was written and `prof` quotes the live value, not this one.
+- `/proc/sys/kernel/perf_event_max_sample_rate` = 10000 as this is written (so `-F` above that is rejected by the kernel; `prof` says so). The kernel auto-throttles this sysctl, so it moves on its own: it has read 14000 and 6000 at other times in this repo's history, and `prof` quotes the live value rather than any of them. `t/run.sh` does not profile at the maximum rate, and "what does not work" says what happens when you do.
 
 `paranoid=2` forbids kernel-mode measurement but permits a user to sample their own processes, all this needs. Every event is opened with `exclude_kernel=1` and `exclude_hv=1`. The event tried first is `PERF_TYPE_HARDWARE`/`PERF_COUNT_HW_CPU_CYCLES`, the one that worked here (`hw cpu-cycles` in the summary line). If no PMU is exposed: a VM or container without PMU pass-through, it falls back to `PERF_TYPE_SOFTWARE`/`PERF_COUNT_SW_CPU_CLOCK` and then `SW_TASK_CLOCK`, both hrtimer-driven. The summary line always names which one it got, so you never have to guess. Those `setitimer`/`SIGPROF`-via-`LD_PRELOAD` and `/proc/PID/stat`-polling fallbacks described as contingencies were not implemented, because they were not needed and writing unused code would be worse than not writing it.
 
@@ -340,8 +340,9 @@ argument for doing it.
 ## Mutation survivors
 
 Everything above was checked by breaking the code and watching the suite go
-red. 26 mutations of the CFI reader and unwinder were run; 22 were caught.
-The four that were not, written down rather than left for someone to discover:
+red. 34 mutations were run across the CFI reader, the unwinder, the separate
+debuginfo lookup and the deep-stack accounting; 30 were caught. The four that
+were not, written down rather than left for someone to discover:
 
 - **`DW_CFA_advance_loc4` reading 2 bytes instead of 4.** Genuinely
   equivalent on any input anyone can write: a 4-byte delta of 1 is
