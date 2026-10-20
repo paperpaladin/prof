@@ -17,8 +17,9 @@ second, and writes a profile of where it spent CPU time.
   where it does not. The summary line reports how many frames came from each,
   so a degraded profile says so instead of looking like a shallow one.
 - Symbols come from `.symtab`, falling back to `.dynsym`, parsed from the ELF
-  files named in `/proc/PID/maps`; unresolvable addresses print as
-  `module+0xoffset`, never as a silent blank.
+  files named in `/proc/PID/maps`, plus the separate debug file named by an
+  object's build-id or `.gnu_debuglink` when it has no `.symtab` of its own;
+  unresolvable addresses print as `module+0xoffset`, never as a silent blank.
 - Two output formats: a flat profile (self/total samples per symbol) by
   default, collapsed stacks (`main;foo;bar 42`) under `--folded`.
 - Output goes to stderr, or to `-o FILE`. Never to stdout.
@@ -46,8 +47,8 @@ Two of them, and every commit is checked against both:
 ## Oracle
 
 Ranked by how much a failure would matter. Items 1 to 7 are ground truth we
-construct; 8 to 10 are outside authorities on DWARF, which is a format we do
-not get to have an opinion about. None of it is a comparison against another
+construct; 8 to 11 are outside authorities on DWARF and ELF, formats we do not
+get to have an opinion about. None of it is a comparison against another
 profiler.
 
 1. Transparency: target stdout byte-identical, exit status `7` preserved,
@@ -82,7 +83,11 @@ profiler.
    output, not written into the test, and the same run with `--no-cfi` must
    collapse to depth 1: otherwise the case is about the chain being easy to
    find rather than about CFI finding it.
-10. `gas`, for the CFI opcodes no real binary emits. `t/cfi_probe.s` writes
+10. `readelf -sW` for the separate debug file, in both directions: the name
+   prof printed must be among the debug file's FUNC symbols and must not be in
+   any table of the stripped library, so reading the file is the only way it
+   could have been known.
+11. `gas`, for the CFI opcodes no real binary emits. `t/cfi_probe.s` writes
    them by hand; gas encodes them and readelf says what they mean. Three
    mutations survived 73246 agreeing rows before this existed.
 
@@ -232,11 +237,20 @@ is worth having in history, not described from memory.
 - [ ] JIT symbol support: read `/tmp/perf-PID.map`.
       why: it is the established convention, it is a text file, and without it
       every JVM/V8/LuaJIT profile is a wall of `module+0x...`.
-- [ ] Separate debuginfo: follow `.gnu_debuglink` and the build-id path under
+- [x] Separate debuginfo: follow `.gnu_debuglink` and the build-id path under
       `/usr/lib/debug`.
       why: distro binaries are stripped, so the symbols that would name
       `libc.so.6+0x1ca7` as `__libc_start_call_main` are sitting on disk
       unread.
+      done: build-id note first, `.gnu_debuglink` and gdb's three search
+      directories second, consulted only for an object with no `.symtab` of
+      its own. `readelf -sW` is the oracle in both directions: the name prof
+      printed is in the debug file's FUNC symbols and in no table of libc
+      itself. Five mutations, all five caught. Also fixed the alias choice,
+      which was whichever name `qsort` left last among the six symbols at
+      libc's entry point. Not done: the `.gnu_debuglink` CRC32 is unchecked,
+      and nothing reads `.debug_info`, so gdb's `__libc_start_main_impl` is
+      still out of reach.
 - [ ] `-p PID` to attach to a running process, degrading cleanly when
       `paranoid` forbids it.
       why: the interesting performance problems are in processes already

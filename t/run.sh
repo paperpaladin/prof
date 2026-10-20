@@ -382,5 +382,61 @@ for plant in 0 1 2; do
 	fi
 done
 
+# --- 12. separate debuginfo ------------------------------------------------
+# A distro libc ships .dynsym and no .symtab, so every internal frame used to
+# print as libc.so.6+0xNNNN -- including the process entry frame, which is how
+# it appeared in this repo's own README. The names are in a separate file named
+# by the build-id, and readelf is the oracle twice over: it says the name is
+# NOT in the library, and it says the name IS in the debug file, whose path is
+# derived from the build-id readelf itself prints. prof only supplies the
+# candidate names; it does not get to say whether they were obtainable.
+$PROF --folded -o "$TMP/dbg.fold" -- $WL 1 >/dev/null 2>&1
+bid=$(readelf -n "$LIBC" 2>/dev/null | sed -n 's/.*Build ID: \([0-9a-f][0-9a-f]*\).*/\1/p' | head -1)
+dbg=
+if [ -n "$bid" ]; then
+	dbg="/usr/lib/debug/.build-id/$(printf '%s' "$bid" | cut -c1-2)/$(printf '%s' "$bid" | cut -c3-).debug"
+fi
+if ! command -v readelf >/dev/null 2>&1; then
+	skip "debuginfo: names come from the separate debug file" "readelf is the oracle here"
+elif [ -z "$LIBC" ] || [ -z "$bid" ]; then
+	bad "debuginfo: names come from the separate debug file" \
+	    "could not find the libc prof links against, or its build-id"
+elif [ ! -r "$dbg" ]; then
+	skip "debuginfo: names come from the separate debug file" \
+	     "no debug file at $dbg (install the libc debug symbols)"
+else
+	# The NAME field of readelf's FUNC lines, exactly. The first version of
+	# this used grep -Fw against the whole dump and reported success on
+	# 'cold', one of the workload's own symbols, because '.' is a word
+	# boundary to grep and libc has a function called __assert_fail_base.cold.
+	# A membership test has to be against the set, not against the text.
+	readelf -sW "$LIBC" 2>/dev/null | awk '$4=="FUNC"{print $NF}' | sort -u >"$TMP/libsyms"
+	readelf -sW "$dbg" 2>/dev/null | awk '$4=="FUNC"{print $NF}' | sort -u >"$TMP/dbgsyms"
+	found=
+	# Every frame name prof produced, innermost field included.
+	for n in $(tr ';' '\n' < "$TMP/dbg.fold" | sed 's/ [0-9]*$//' | sort -u); do
+		grep -Fxq -- "$n" "$TMP/dbgsyms" || continue
+		grep -Fxq -- "$n" "$TMP/libsyms" && continue
+		found=$n
+		break
+	done
+	if [ ! -s "$TMP/dbgsyms" ] || [ ! -s "$TMP/libsyms" ]; then
+		bad "debuginfo: names come from the separate debug file" \
+		    "readelf printed no symbols; nothing was actually compared"
+	elif [ -n "$found" ]; then
+		ok "debuginfo: '$found' is in $(basename "$dbg") and in no table of libc itself"
+	else
+		bad "debuginfo: names come from the separate debug file" \
+		    "no frame name was obtainable only from the debug file: $(head -1 "$TMP/dbg.fold")"
+	fi
+	# ... and the symptom itself: no libc frame left as module+offset.
+	if [ "$(wc -l < "$TMP/dbg.fold")" -gt 0 ] && ! grep -q 'libc[^;]*+0x' "$TMP/dbg.fold"; then
+		ok "debuginfo: no libc frame is left as module+offset"
+	else
+		bad "debuginfo: no libc frame should be left as module+offset" \
+		    "$(head -1 "$TMP/dbg.fold")"
+	fi
+fi
+
 printf '\n%d passed, %d failed, %d skipped\n' "$P" "$F" "$S"
 [ "$F" -eq 0 ]

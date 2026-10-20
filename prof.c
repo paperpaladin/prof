@@ -160,6 +160,22 @@ struct map {
 struct sym {
 	uint64_t addr, size;
 	char *name;
+	/* Which name to print when several symbols share an address, which is
+	 * routine. libc's entry point is all of: __libc_start_main_impl,
+	 * __libc_start_main_alias_1 and _alias_2 (all three LOCAL in .symtab),
+	 * __libc_start_main in .dynsym, and __libc_start_main@@GLIBC_2.34 and
+	 * @GLIBC_2.2.5 as versioned aliases. Lower rank wins: unversioned ahead
+	 * of versioned, and the exported .dynsym name ahead of a .symtab alias,
+	 * because the exported name is the one a reader recognises. Ties break on
+	 * strcmp so the choice is deterministic; before this it was whichever one
+	 * qsort happened to leave last.
+	 *
+	 * gdb says __libc_start_main_impl for that address, from the
+	 * DW_AT_name of the subprogram in .debug_info. That is a different and
+	 * better source, and reading it is Milestone 1's inline-frames item; it
+	 * is why the suite does not assert prof and gdb agree frame for frame
+	 * on a name no symbol table singles out. */
+	unsigned char rank;
 };
 
 static struct map maps[512];
@@ -167,7 +183,7 @@ static int nmaps;
 static struct sym *syms;
 static size_t nsyms, csyms;
 
-static void sym_add(uint64_t addr, uint64_t size, const char *name) {
+static void sym_add(uint64_t addr, uint64_t size, const char *name, int dynsym) {
 	if (nsyms == csyms) {
 		csyms = csyms ? csyms * 2 : 4096;
 		syms = realloc(syms, csyms * sizeof *syms);
@@ -176,6 +192,7 @@ static void sym_add(uint64_t addr, uint64_t size, const char *name) {
 	syms[nsyms].addr = addr;
 	syms[nsyms].size = size;
 	syms[nsyms].name = strdup(name);
+	syms[nsyms].rank = (unsigned char)((strchr(name, '@') ? 2 : 0) + (dynsym ? 0 : 1));
 	nsyms++;
 }
 
@@ -183,7 +200,8 @@ static int sym_cmp(const void *a, const void *b) {
 	const struct sym *x = a, *y = b;
 	if (x->addr < y->addr) return -1;
 	if (x->addr > y->addr) return 1;
-	return 0;
+	if (x->rank != y->rank) return x->rank < y->rank ? -1 : 1;
+	return strcmp(x->name, y->name); /* total order, so the sort is stable */
 }
 
 /* Load bias for a file mapped at m: the value to add to an st_value from the
@@ -900,20 +918,13 @@ static int cfi_dump(const char *path) {
  * the object's CFI, with c->ok == 0 if it has none we can index. A file with
  * no section headers at all still has CFI: that is the stripped-distro-library
  * case, where the symbols are gone and the unwind tables are not. */
-static uint64_t load_object(const struct map *m, struct cfi *c) {
-	size_t size;
-	const Elf64_Ehdr *eh;
-	char *b = elf_map(m->path, &size, &eh);
-	if (!b) {
-		memset(c, 0, sizeof *c);
-		return 0;
-	}
-	uint64_t bias = load_bias(eh, b, m);
-	cfi_load(c, b, size, eh);
-
+/* Pull every STT_FUNC out of one mapped ELF file's .symtab, or .dynsym if it
+ * has no .symtab. Returns 1 if a real .symtab was found, which is what tells
+ * the caller whether to go looking for a separate debug file. */
+static int load_syms(const char *b, size_t size, const Elf64_Ehdr *eh, uint64_t bias) {
 	if (eh->e_shoff == 0 || eh->e_shentsize != sizeof(Elf64_Shdr) ||
 	    eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(Elf64_Shdr) > (uint64_t)size)
-		goto out;
+		return 0;
 
 	const Elf64_Shdr *sh = (const Elf64_Shdr *)(b + eh->e_shoff);
 
@@ -933,12 +944,140 @@ static uint64_t load_object(const struct map *m, struct cfi *c) {
 			if (sy[k].st_name >= strs->sh_size) continue;
 			const char *nm = sp + sy[k].st_name;
 			if (!*nm) continue;
-			sym_add(bias + sy[k].st_value, sy[k].st_size, nm);
+			sym_add(bias + sy[k].st_value, sy[k].st_size, nm,
+			        sh[i].sh_type == SHT_DYNSYM);
 		}
 		/* .symtab is a superset of .dynsym, so stop once we've found it. */
-		if (sh[i].sh_type == SHT_SYMTAB) break;
+		if (sh[i].sh_type == SHT_SYMTAB) return 1;
 	}
-out:
+	return 0;
+}
+
+/* The GNU build ID: a note in a PT_NOTE segment, and the one identifier that
+ * names a debug file without any chance of pairing the wrong one with it. */
+static int build_id(const char *b, size_t size, const Elf64_Ehdr *eh,
+                    unsigned char *id, size_t *idlen) {
+	const Elf64_Phdr *ph = (const Elf64_Phdr *)(b + eh->e_phoff);
+	for (int i = 0; i < eh->e_phnum; i++) {
+		if (ph[i].p_type != PT_NOTE) continue;
+		if (ph[i].p_offset + ph[i].p_filesz > size) continue;
+		uint64_t o = ph[i].p_offset, end = o + ph[i].p_filesz;
+		while (o + sizeof(Elf64_Nhdr) <= end) {
+			Elf64_Nhdr n;
+			memcpy(&n, b + o, sizeof n);
+			uint64_t na = ((uint64_t)n.n_namesz + 3) & ~(uint64_t)3;
+			uint64_t da = ((uint64_t)n.n_descsz + 3) & ~(uint64_t)3;
+			uint64_t body = o + sizeof n;
+			if (body + na + da > end || body + na + da < body) break;
+			if (n.n_type == NT_GNU_BUILD_ID && n.n_namesz == 4 &&
+			    memcmp(b + body, "GNU", 4) == 0 &&
+			    n.n_descsz >= 2 && n.n_descsz <= 64) {
+				memcpy(id, b + body + na, n.n_descsz);
+				*idlen = n.n_descsz;
+				return 1;
+			}
+			o = body + na + da;
+		}
+	}
+	return 0;
+}
+
+/* Section contents by name, which needs e_shstrndx. Only .gnu_debuglink is
+ * looked up this way; everything else here is found by type or address. */
+static const char *section_by_name(const char *b, size_t size, const Elf64_Ehdr *eh,
+                                   const char *want, uint64_t *len) {
+	if (eh->e_shoff == 0 || eh->e_shentsize != sizeof(Elf64_Shdr) ||
+	    eh->e_shstrndx >= eh->e_shnum ||
+	    eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(Elf64_Shdr) > (uint64_t)size)
+		return NULL;
+	const Elf64_Shdr *sh = (const Elf64_Shdr *)(b + eh->e_shoff);
+	const Elf64_Shdr *st = &sh[eh->e_shstrndx];
+	if (st->sh_offset + st->sh_size > (uint64_t)size) return NULL;
+	for (int i = 0; i < eh->e_shnum; i++) {
+		if (sh[i].sh_name >= st->sh_size) continue;
+		if (strcmp(b + st->sh_offset + sh[i].sh_name, want) != 0) continue;
+		if (sh[i].sh_offset + sh[i].sh_size > (uint64_t)size) return NULL;
+		*len = sh[i].sh_size;
+		return b + sh[i].sh_offset;
+	}
+	return NULL;
+}
+
+/* Where the symbols for a stripped object actually live.
+ *
+ * A distro ships libc with .dynsym (the exported names) and no .symtab, so
+ * every internal frame prints as libc.so.6+0xNNNN -- including the process
+ * entry frame, which is how __libc_start_call_main used to appear in this
+ * repo's own README. The names are on disk in a separate file, found two ways:
+ *
+ *   /usr/lib/debug/.build-id/XX/REST.debug   from the GNU build-id note
+ *   .gnu_debuglink                           a filename, looked for beside
+ *                                            the object, in its .debug/, and
+ *                                            under /usr/lib/debug/
+ *
+ * Build-id first: it cannot pair a debug file with the wrong binary.
+ *
+ * shortcut: .gnu_debuglink carries a CRC32 of the debug file and this does not
+ * check it, so a stale debug file beside a rebuilt binary would be trusted.
+ * zlib's crc32() is the fix if it ever matters; the build-id path, which every
+ * distro uses, has no such hole because the name IS the identity. */
+static int debug_file(const struct map *m, const char *b, size_t size,
+                      const Elf64_Ehdr *eh, char *out, size_t outsz) {
+	unsigned char id[64];
+	size_t idlen = 0;
+	uint64_t dlen = 0;
+	const char *link;
+
+	if (build_id(b, size, eh, id, &idlen)) {
+		char hex[130];
+		for (size_t i = 1; i < idlen; i++)
+			snprintf(hex + (i - 1) * 2, 3, "%02x", id[i]);
+		snprintf(out, outsz, "/usr/lib/debug/.build-id/%02x/%s.debug", id[0], hex);
+		if (access(out, R_OK) == 0) return 1;
+	}
+
+	link = section_by_name(b, size, eh, ".gnu_debuglink", &dlen);
+	if (link && dlen && memchr(link, 0, dlen)) {
+		char dir[PATH_MAX];
+		const char *slash = strrchr(m->path, '/');
+		size_t n = slash ? (size_t)(slash - m->path) : 1;
+		if (n >= sizeof dir) return 0;
+		memcpy(dir, m->path, n);
+		dir[n] = 0;
+		if (!slash) strcpy(dir, ".");
+		const char *fmt[] = {"%s/%s", "%s/.debug/%s", "/usr/lib/debug%s/%s"};
+		for (int i = 0; i < 3; i++) {
+			snprintf(out, outsz, fmt[i], dir, link);
+			if (access(out, R_OK) == 0) return 1;
+		}
+	}
+	return 0;
+}
+
+static uint64_t load_object(const struct map *m, struct cfi *c) {
+	size_t size;
+	const Elf64_Ehdr *eh;
+	char dbg[PATH_MAX];
+	char *b = elf_map(m->path, &size, &eh);
+	if (!b) {
+		memset(c, 0, sizeof *c);
+		return 0;
+	}
+	uint64_t bias = load_bias(eh, b, m);
+	cfi_load(c, b, size, eh);
+
+	/* CFI comes from the object itself: a debug file's .eh_frame is SHT_NOBITS
+	 * (no contents), which is also why readelf prints a warning about one. */
+	if (!load_syms(b, size, eh, bias) && debug_file(m, b, size, eh, dbg, sizeof dbg)) {
+		size_t dsize;
+		const Elf64_Ehdr *deh;
+		char *d = elf_map(dbg, &dsize, &deh);
+		if (d) {
+			/* Same bias: a debug file keeps the original st_values. */
+			load_syms(d, dsize, deh, bias);
+			munmap(d, dsize);
+		}
+	}
 	munmap(b, size);
 	return bias;
 }
@@ -1079,6 +1218,9 @@ static const char *resolve(uint64_t a, char *buf, size_t bufsz) {
 	 * symbol and falls through to module+offset below; reading
 	 * /tmp/perf-PID.map is the established fix. */
 	if (best != (size_t)-1) {
+		/* Several symbols can share an address; sym_cmp puts the one to print
+		 * first, so back up to the start of the run. */
+		while (best > 0 && syms[best - 1].addr == syms[best].addr) best--;
 		/* st_size == 0 happens for hand-written asm; accept it rather than
 		 * dropping the symbol, and let the next symbol bound it. */
 		uint64_t end = syms[best].size ? syms[best].addr + syms[best].size

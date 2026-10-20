@@ -32,7 +32,7 @@ The second reason is that profilers are unusually easy to get silently, confiden
 
 Three separate copies of the same loop, with a 10x and 100x iteration count. Not a shared `burn()` helper, if all three called one helper, every sample would land in the helper and the ratios would be untestable. And `hot()` is reachable only via `main -> level1 -> level2 -> hot`, so the correct stack is fixed by the source, not by measurement.
 
-`t/run.sh` then asserts 22 things, in roughly descending order of how badly a failure would matter:
+`t/run.sh` then asserts 24 things, in roughly descending order of how badly a failure would matter:
 
 1. Transparency. The target's stdout is byte-identical and its exit status (a distinctive `7`) passes through unchanged, with or without the profiler. A profiler that perturbs its target is worse than no profiler.
 2. The planted hot loop is found. `hot()` takes >60% of samples (built to be ~90%) and >3x the samples of `warm()` (built as 10x), and `warm()` outweighs `cold()`.
@@ -81,6 +81,16 @@ output* rather than hardcoding it, and requires `prof --folded` to contain it.
 The same run then repeats with `--no-cfi`, where it must collapse to depth 1.
 Without that second half the first proves nothing about CFI.
 
+**`readelf -sW`** again, as the oracle for the separate debug file, and it is
+the oracle in both directions: the name prof printed must be in the debug
+file's `FUNC` symbols and must NOT be in any table of libc itself, so the
+only way prof could have known it is by reading the file. prof supplies the
+candidate names and nothing else. The first version of that check used
+`grep -Fw` over readelf's whole dump and reported success on `cold`, one of
+the workload's own symbols, because `.` is a word boundary to grep and libc
+has a function called `__assert_fail_base.cold`. A membership test has to be
+against the set, not against the text.
+
 **`gas`**, for the opcodes nothing else emits. A sweep over everything above
 (500k CFI opcodes) finds only eleven distinct ones, so six opcodes this parser
 implements were unreachable from any real file and three mutations of them
@@ -117,8 +127,10 @@ ok    unwinder choice: no .eh_frame for this object, 2666 frames from the RBP wa
 ok    asan: the CFI path is clean under AddressSanitizer
 ok    asan: an over-read past the .eh_frame copy is reported
 ok    asan: an over-read past the sample record is reported
+ok    debuginfo: '__libc_start_call_main' is in 5b51f4c39af9ac589408c1dc432ba390a273cc.debug and in no table of libc itself
+ok    debuginfo: no libc frame is left as module+offset
 
-22 passed, 0 failed, 0 skipped
+24 passed, 0 failed, 0 skipped
 ```
 
 The `cfi:` line compares prof against readelf over this repo's own binaries and
@@ -138,27 +150,27 @@ sample rate (840 samples / 0.85 s = 988 Hz) matches the 997 Hz asked for.
 ```
 $ ./prof -- ./t/workload 1
 workload: ok reps=1
-# flat profile: 672 samples
+# flat profile: 694 samples
 #   self%     self   total%    total  symbol
-   90.48      608   90.48      608  hot
-    8.63       58    8.63       58  warm
-    0.89        6    0.89        6  cold
-    0.00        0  100.00      672  __libc_start_main
-    0.00        0  100.00      672  _start
-    0.00        0   90.48      608  level1
-    0.00        0   90.48      608  level2
-    0.00        0  100.00      672  libc.so.6+0x1ca7
-    0.00        0  100.00      672  main
-prof: 672 samples, 0 lost, 0 truncated stacks, hw cpu-cycles @ 997 Hz, 8/8 cpus
-prof: unwind: 4028 frames via .eh_frame CFI, 0 via frame pointers (0/672 samples fell back)
+   90.63      629   90.63      629  hot
+    8.65       60    8.65       60  warm
+    0.72        5    0.72        5  cold
+    0.00        0  100.00      694  __libc_start_call_main
+    0.00        0  100.00      694  __libc_start_main
+    0.00        0  100.00      694  _start
+    0.00        0   90.63      629  level1
+    0.00        0   90.63      629  level2
+    0.00        0  100.00      694  main
+prof: 694 samples, 0 lost, 0 truncated stacks, hw cpu-cycles @ 997 Hz, 8/8 cpus
+prof: unwind: 4055 frames via .eh_frame CFI, 0 via frame pointers (0/694 samples fell back)
 
 $ ./prof --folded -- ./t/workload_nofp 1      # built -O2 -fomit-frame-pointer
 workload: ok reps=1
-_start;__libc_start_main;libc.so.6+0x1ca7;main;level1;level2;hot 636
-_start;__libc_start_main;libc.so.6+0x1ca7;main;warm 60
-_start;__libc_start_main;libc.so.6+0x1ca7;main;cold 6
-prof: 702 samples, 0 lost, 0 truncated stacks, hw cpu-cycles @ 997 Hz, 8/8 cpus
-prof: unwind: 4080 frames via .eh_frame CFI, 0 via frame pointers (0/702 samples fell back)
+_start;__libc_start_main;__libc_start_call_main;main;level1;level2;hot 611
+_start;__libc_start_main;__libc_start_call_main;main;warm 61
+_start;__libc_start_main;__libc_start_call_main;main;cold 7
+prof: 679 samples, 0 lost, 0 truncated stacks, hw cpu-cycles @ 997 Hz, 8/8 cpus
+prof: unwind: 3938 frames via .eh_frame CFI, 0 via frame pointers (0/679 samples fell back)
 ```
 
 The second line of the summary is the per-mapping unwinder choice, reported
@@ -167,7 +179,24 @@ RBP walk where it does not, counted per frame, plus how many samples needed
 the fallback at all. A profiler that silently degrades is how you end up
 believing a wrong flamegraph.
 
-`self` is samples whose innermost frame is this symbol; `total` is samples with this symbol anywhere in the stack. The profile goes to stderr unless you pass `-o FILE`, and never to stdout, that is what makes `prof, ./prog | consumer` safe. `libc.so.6+0x1ca7` is `__libc_start_call_main`, which a stripped distro libc does not export; `module+offset` is the honest answer there.
+`self` is samples whose innermost frame is this symbol; `total` is samples with this symbol anywhere in the stack. The profile goes to stderr unless you pass `-o FILE`, and never to stdout, that is what makes `prof, ./prog | consumer` safe.
+
+`__libc_start_call_main` used to read `libc.so.6+0x1ca7` here, because a
+stripped distro libc does not export it. It comes from the separate debug
+file, found through the GNU build-id note at
+`/usr/lib/debug/.build-id/XX/REST.debug`, falling back to `.gnu_debuglink` and
+the three directories gdb looks in. Without that file installed it is
+`libc.so.6+0x1ca7` again, and `module+offset` remains the honest answer when
+there is no name to be had.
+
+One address usually has several names. libc's entry point is
+`__libc_start_main_impl`, `__libc_start_main_alias_1` and `_alias_2` in
+`.symtab`, `__libc_start_main` in `.dynsym`, and two versioned aliases on top.
+prof prints the unversioned exported one, then any unversioned `.symtab` name,
+then the versioned ones, breaking ties on `strcmp` so the choice is
+deterministic; it used to be whichever one `qsort` happened to leave last. gdb
+says `__libc_start_main_impl`, from `DW_AT_name` in `.debug_info`, which is a
+better source that this does not read: see the inline-frames item in `PLAN.md`.
 
 Pipe the folded form straight into a flamegraph:
 
@@ -230,7 +259,9 @@ does not have that problem.
 - No off-CPU profiling. A process blocked on I/O generates no cycles and no samples; `prof` says "no samples" instead of telling you where it was blocked.
 - No inline-frame expansion. One address maps to one symbol. Inlined callees are attributed to the function they were inlined into (which is also why the workload builds with `-fno-inline`).
 - 8KB of stack is copied per sample, so stacks deeper than that are truncated. The count of truncations is reported in the summary line, not hidden. (A figure of 92 truncations "from a two-thread test" used to sit here. That target does not exist in this repo and `n_trunc` is not asserted anywhere in the harness.)
-- 64-bit little-endian ELF only. No 32-bit, no separate debuginfo files, no compressed debug sections, no C++ demangling.
+- 64-bit little-endian ELF only. No 32-bit, no compressed debug sections, no C++ demangling.
+- The `.gnu_debuglink` CRC32 is not checked, so a stale debug file left beside a rebuilt binary would be believed. The build-id path, which is what distros actually use, has no such hole: the filename is the identity. zlib's `crc32()` is the fix if it ever matters.
+- Nothing is read from `.debug_info`. One address maps to one symbol-table name, so an inlined callee is attributed to its caller and a function with several aliases gets whichever alias the rule above picks rather than the one the compiler called it.
 - One snapshot of symbols per object. A `dlopen` is picked up (maps are refreshed continuously) but an unmap/remap at the same address is not.
 - Symbols from every sampled process share one table, so a target that `fork()`s has its children's PIE addresses resolved against the parent's mappings. `inherit=1` samples them. Naming them correctly needs `PERF_RECORD_FORK`/`MMAP2`.
 
